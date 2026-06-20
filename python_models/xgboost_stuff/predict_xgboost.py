@@ -81,12 +81,15 @@ def full_feature_pipeline(X_target, pipeline_state):
     return X_target_enc
 
 def main():
-    if len(sys.argv) < 2:
+    # Support both direct command-line tests and JSON sent by the Node server.
+    raw_payload = sys.argv[1] if len(sys.argv) > 1 else sys.stdin.read().strip()
+    
+    if not raw_payload:
         print(json.dumps({"error": "No input data provided."}))
         sys.exit(1)
         
     try:
-        input_data = json.loads(sys.argv[1])
+        input_data = json.loads(raw_payload)
         df_in = pd.DataFrame([input_data])
         
         drop_cols = ["Name", "Symbol", "Rating Agency Name", "Date", "RatingClass", "Rating"]
