@@ -54,4 +54,9 @@ function predictXGBoost(inputData) {
   });
 }
 
-module.exports = { predictXGBoost };
+module.exports = {
+  predictXGBoost,
+  name: "XGBoost",
+  route: "/predict/xgboost",
+  scriptPath: "python_models/xgboost_stuff/predict_xgboost.py"
+};

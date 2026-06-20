@@ -197,6 +197,33 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Predict endpoint for the Python-trained XGBoost model.
+  if (req.method === "POST" && req.url === xgboostModel.route) {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+
+    req.on("end", () => {
+      let requestPayload;
+
+      try {
+        requestPayload = body ? JSON.parse(body) : {};
+      } catch (err) {
+        sendJson(res, 400, {
+          error: "Invalid JSON request body.",
+          details: err.message
+        });
+        return;
+      }
+
+      runPythonModel(xgboostModel.scriptPath, requestPayload, res);
+    });
+
+    return;
+  }
+
   const filePath = safeResolve(req.url);
   if (!filePath) {
     send(res, 403, "Forbidden", "text/plain; charset=utf-8");
