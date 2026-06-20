@@ -423,6 +423,29 @@
 
     select option { background: #0d1726; color: var(--text); }
 
+    .ratio-form {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .ratio-field { display: grid; gap: 5px; color: var(--muted); font-size: 0.82rem; }
+
+    .ratio-field input {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(255,255,255,0.05);
+      color: var(--text);
+      padding: 9px 10px;
+      font: inherit;
+    }
+
+    .prediction-result { min-height: 1.4em; margin: 12px 0 0; color: var(--muted); }
+    .prediction-result.success { color: var(--accent); font-weight: 700; }
+    .prediction-result.error { color: var(--danger); }
+
     .chips {
       display: flex;
       flex-wrap: wrap;
@@ -762,6 +785,37 @@
                   </select>
                   <button class="button" id="analyzeBtn" type="button">Run analysis</button>
                 </div>
+                <p class="panel-copy" style="margin-top: 14px;">
+                  Random Forest uses the 25 financial ratios below. Other model options retain the existing dashboard flow.
+                </p>
+                <div class="ratio-form" id="randomForestRatioForm">
+                  <label class="ratio-field">Current ratio<input data-ratio-feature="currentRatio" type="number" step="any" value="2.1" /></label>
+                  <label class="ratio-field">Quick ratio<input data-ratio-feature="quickRatio" type="number" step="any" value="1.5" /></label>
+                  <label class="ratio-field">Cash ratio<input data-ratio-feature="cashRatio" type="number" step="any" value="0.8" /></label>
+                  <label class="ratio-field">Days sales outstanding<input data-ratio-feature="daysOfSalesOutstanding" type="number" step="any" value="40" /></label>
+                  <label class="ratio-field">Net profit margin<input data-ratio-feature="netProfitMargin" type="number" step="any" value="0.12" /></label>
+                  <label class="ratio-field">Pretax profit margin<input data-ratio-feature="pretaxProfitMargin" type="number" step="any" value="0.15" /></label>
+                  <label class="ratio-field">Gross profit margin<input data-ratio-feature="grossProfitMargin" type="number" step="any" value="0.35" /></label>
+                  <label class="ratio-field">Operating profit margin<input data-ratio-feature="operatingProfitMargin" type="number" step="any" value="0.18" /></label>
+                  <label class="ratio-field">Return on assets<input data-ratio-feature="returnOnAssets" type="number" step="any" value="0.08" /></label>
+                  <label class="ratio-field">Return on capital employed<input data-ratio-feature="returnOnCapitalEmployed" type="number" step="any" value="0.1" /></label>
+                  <label class="ratio-field">Return on equity<input data-ratio-feature="returnOnEquity" type="number" step="any" value="0.2" /></label>
+                  <label class="ratio-field">Asset turnover<input data-ratio-feature="assetTurnover" type="number" step="any" value="1.4" /></label>
+                  <label class="ratio-field">Fixed asset turnover<input data-ratio-feature="fixedAssetTurnover" type="number" step="any" value="2" /></label>
+                  <label class="ratio-field">Debt-to-equity ratio<input data-ratio-feature="debtEquityRatio" type="number" step="any" value="0.6" /></label>
+                  <label class="ratio-field">Debt ratio<input data-ratio-feature="debtRatio" type="number" step="any" value="0.3" /></label>
+                  <label class="ratio-field">Effective tax rate<input data-ratio-feature="effectiveTaxRate" type="number" step="any" value="0.22" /></label>
+                  <label class="ratio-field">FCF / operating cash flow<input data-ratio-feature="freeCashFlowOperatingCashFlowRatio" type="number" step="any" value="0.7" /></label>
+                  <label class="ratio-field">Free cash flow per share<input data-ratio-feature="freeCashFlowPerShare" type="number" step="any" value="1.2" /></label>
+                  <label class="ratio-field">Cash per share<input data-ratio-feature="cashPerShare" type="number" step="any" value="0.9" /></label>
+                  <label class="ratio-field">Equity multiplier<input data-ratio-feature="companyEquityMultiplier" type="number" step="any" value="1.5" /></label>
+                  <label class="ratio-field">EBIT / revenue<input data-ratio-feature="ebitPerRevenue" type="number" step="any" value="0.16" /></label>
+                  <label class="ratio-field">Enterprise value multiple<input data-ratio-feature="enterpriseValueMultiple" type="number" step="any" value="8.5" /></label>
+                  <label class="ratio-field">Operating cash flow per share<input data-ratio-feature="operatingCashFlowPerShare" type="number" step="any" value="1.1" /></label>
+                  <label class="ratio-field">Operating cash flow / sales<input data-ratio-feature="operatingCashFlowSalesRatio" type="number" step="any" value="0.2" /></label>
+                  <label class="ratio-field">Payables turnover<input data-ratio-feature="payablesTurnover" type="number" step="any" value="4" /></label>
+                </div>
+                <p id="predictionResult" class="prediction-result" aria-live="polite"></p>
               </div>
 
               <div class="chips" style="margin-top: 16px;">

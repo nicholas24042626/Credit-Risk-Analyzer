@@ -44,6 +44,8 @@ function initApp() {
   const shapNarrative = document.getElementById("shapNarrative");
   const matrixGrid = document.getElementById("matrixGrid");
   const shapBars = document.getElementById("shapBars");
+  const ratioInputs = document.querySelectorAll("[data-ratio-feature]");
+  const predictionResult = document.getElementById("predictionResult");
 
   function showScreen(screen) {
     [uploadScreen, modelScreen, resultsScreen].forEach((node) => node.classList.remove("active"));
@@ -150,6 +152,63 @@ function initApp() {
     showScreen(resultsScreen);
   }
 
+  function updateActionLabel() {
+    analyzeBtn.textContent = modelSelect.value === "Random Forest" ? "Predict" : "Run analysis";
+  }
+
+  function getRandomForestPayload() {
+    const payload = {};
+
+    for (const input of ratioInputs) {
+      const value = Number(input.value);
+      if (!Number.isFinite(value)) {
+        throw new Error(`${input.labels[0]?.textContent || input.name} must be a number.`);
+      }
+      payload[input.dataset.ratioFeature] = value;
+    }
+
+    return payload;
+  }
+
+  async function predictRandomForest() {
+    let payload;
+
+    try {
+      payload = getRandomForestPayload();
+    } catch (error) {
+      predictionResult.textContent = error.message;
+      predictionResult.className = "prediction-result error";
+      return;
+    }
+
+    analyzeBtn.disabled = true;
+    predictionResult.textContent = "Running Random Forest prediction…";
+    predictionResult.className = "prediction-result";
+
+    try {
+      const response = await fetch("/predict/random-forest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || "Random Forest prediction failed.");
+      }
+
+      predictionResult.textContent = `Prediction: ${result.prediction}`;
+      predictionResult.className = "prediction-result success";
+      runAnalysis();
+      selectedModelTag.textContent = `Model: Random Forest · Prediction: ${result.prediction}`;
+    } catch (error) {
+      predictionResult.textContent = error.message || "Unable to get a prediction.";
+      predictionResult.className = "prediction-result error";
+    } finally {
+      analyzeBtn.disabled = false;
+    }
+  }
+
   browseBtn.addEventListener("click", () => fileInput.click());
 
   fileInput.addEventListener("change", (event) => {
@@ -164,9 +223,15 @@ function initApp() {
   });
 
   analyzeBtn.addEventListener("click", () => {
+    if (modelSelect.value === "Random Forest") {
+      predictRandomForest();
+      return;
+    }
     if (!appState.uploaded) return;
     runAnalysis();
   });
+
+  modelSelect.addEventListener("change", updateActionLabel);
 
   dropzone.addEventListener("dragover", (event) => {
     event.preventDefault();
@@ -200,6 +265,7 @@ function initApp() {
   renderMatrix("Decision Tree");
   renderShap("Decision Tree");
   renderMetrics("Decision Tree");
+  updateActionLabel();
 }
 
 if (document.readyState === "loading") {

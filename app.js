@@ -80,8 +80,14 @@ const server = http.createServer((req, res) => {
         return;
       }
 
+      // Prefer the project virtual environment so Python packages match the model setup.
+      const venvPython = path.join(root, ".venv", "Scripts", "python.exe");
+      const pythonExecutable = fs.existsSync(venvPython) ? venvPython : "python";
       const pythonArgs = [scriptPath, JSON.stringify(requestPayload)];
-      const pythonProcess = spawn("python", pythonArgs, { windowsHide: true });
+      const pythonProcess = spawn(pythonExecutable, pythonArgs, {
+        cwd: root,
+        windowsHide: true
+      });
       let stdoutData = "";
       let stderrData = "";
       let hasResponded = false;
@@ -115,7 +121,7 @@ const server = http.createServer((req, res) => {
           sendJson(res, 500, {
             error: "Python prediction process failed.",
             exitCode: code,
-            stderr: stderrData.trim()
+            stderr: stderrData.trim() || "No error output was provided."
           });
           return;
         }
@@ -125,6 +131,7 @@ const server = http.createServer((req, res) => {
         try {
           const parsedOutput = JSON.parse(trimmedOutput);
           hasResponded = true;
+          // scikit-learn can emit non-fatal warnings on stderr; valid stdout wins.
           sendJson(res, 200, parsedOutput);
         } catch (err) {
           hasResponded = true;
