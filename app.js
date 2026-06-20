@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 
+const decisionTreeModel = require("./models/decisionTree");
 const randomForestModel = require("./models/randomForest");
 
 const root = __dirname;
@@ -29,6 +30,98 @@ function sendJson(res, statusCode, payload) {
   send(res, statusCode, JSON.stringify(payload), "application/json; charset=utf-8");
 }
 
+function runPythonModel(scriptRelativePath, requestPayload, res) {
+  const scriptPath = path.join(__dirname, scriptRelativePath);
+
+  if (!fs.existsSync(scriptPath)) {
+    sendJson(res, 500, {
+      error: "Python prediction script not found.",
+      expectedPath: scriptPath
+    });
+    return;
+  }
+
+  let body = "";
+
+  try {
+    body = JSON.stringify(requestPayload || {});
+  } catch (err) {
+    sendJson(res, 400, {
+      error: "Request payload could not be serialized.",
+      details: err.message
+    });
+    return;
+  }
+
+  const venvPython = path.join(root, ".venv", "Scripts", "python.exe");
+  const pythonExecutable = fs.existsSync(venvPython) ? venvPython : "python";
+  const pythonArgs = [scriptPath];
+  const pythonProcess = spawn(pythonExecutable, pythonArgs, {
+    cwd: root,
+    windowsHide: true
+  });
+
+  if (pythonProcess.stdin) {
+    pythonProcess.stdin.write(body);
+    pythonProcess.stdin.end();
+  }
+
+  let stdoutData = "";
+  let stderrData = "";
+  let hasResponded = false;
+
+  pythonProcess.stdout.on("data", (data) => {
+    stdoutData += data.toString();
+  });
+
+  pythonProcess.stderr.on("data", (data) => {
+    stderrData += data.toString();
+  });
+
+  pythonProcess.on("error", (err) => {
+    if (hasResponded) {
+      return;
+    }
+    hasResponded = true;
+    sendJson(res, 500, {
+      error: "Failed to start Python process.",
+      details: err.message
+    });
+  });
+
+  pythonProcess.on("close", (code) => {
+    if (hasResponded) {
+      return;
+    }
+
+    if (code !== 0) {
+      hasResponded = true;
+      sendJson(res, 500, {
+        error: "Python prediction process failed.",
+        exitCode: code,
+        stderr: stderrData.trim() || "No error output was provided."
+      });
+      return;
+    }
+
+    const trimmedOutput = stdoutData.trim();
+
+    try {
+      const parsedOutput = JSON.parse(trimmedOutput);
+      hasResponded = true;
+      sendJson(res, 200, parsedOutput);
+    } catch (err) {
+      hasResponded = true;
+      sendJson(res, 500, {
+        error: "Python process returned invalid JSON.",
+        details: err.message,
+        stdout: trimmedOutput,
+        stderr: stderrData.trim()
+      });
+    }
+  });
+}
+
 function safeResolve(requestPath) {
   const cleanPath = requestPath.split("?")[0].split("#")[0];
   const relativePath = cleanPath === "/" ? "/views/index.html" : cleanPath;
@@ -49,18 +142,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Predict endpoint for the Python-trained Random Forest model.
-  if (req.method === "POST" && req.url === randomForestModel.route) {
-    const scriptPath = path.join(__dirname, "python_models", "predict_random_forest.py");
-
-    if (!fs.existsSync(scriptPath)) {
-      sendJson(res, 500, {
-        error: "Python prediction script not found.",
-        expectedPath: scriptPath
-      });
-      return;
-    }
-
+  if (req.method === "POST" && req.url === decisionTreeModel.route) {
     let body = "";
 
     req.on("data", (chunk) => {
@@ -80,69 +162,34 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      // Prefer the project virtual environment so Python packages match the model setup.
-      const venvPython = path.join(root, ".venv", "Scripts", "python.exe");
-      const pythonExecutable = fs.existsSync(venvPython) ? venvPython : "python";
-      const pythonArgs = [scriptPath, JSON.stringify(requestPayload)];
-      const pythonProcess = spawn(pythonExecutable, pythonArgs, {
-        cwd: root,
-        windowsHide: true
-      });
-      let stdoutData = "";
-      let stderrData = "";
-      let hasResponded = false;
+      runPythonModel(decisionTreeModel.scriptPath, requestPayload, res);
+    });
 
-      pythonProcess.stdout.on("data", (data) => {
-        stdoutData += data.toString();
-      });
+    return;
+  }
 
-      pythonProcess.stderr.on("data", (data) => {
-        stderrData += data.toString();
-      });
+  // Predict endpoint for the Python-trained Random Forest model.
+  if (req.method === "POST" && req.url === randomForestModel.route) {
+    let body = "";
 
-      pythonProcess.on("error", (err) => {
-        if (hasResponded) {
-          return;
-        }
-        hasResponded = true;
-        sendJson(res, 500, {
-          error: "Failed to start Python process.",
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+
+    req.on("end", () => {
+      let requestPayload;
+
+      try {
+        requestPayload = body ? JSON.parse(body) : {};
+      } catch (err) {
+        sendJson(res, 400, {
+          error: "Invalid JSON request body.",
           details: err.message
         });
-      });
+        return;
+      }
 
-      pythonProcess.on("close", (code) => {
-        if (hasResponded) {
-          return;
-        }
-
-        if (code !== 0) {
-          hasResponded = true;
-          sendJson(res, 500, {
-            error: "Python prediction process failed.",
-            exitCode: code,
-            stderr: stderrData.trim() || "No error output was provided."
-          });
-          return;
-        }
-
-        const trimmedOutput = stdoutData.trim();
-
-        try {
-          const parsedOutput = JSON.parse(trimmedOutput);
-          hasResponded = true;
-          // scikit-learn can emit non-fatal warnings on stderr; valid stdout wins.
-          sendJson(res, 200, parsedOutput);
-        } catch (err) {
-          hasResponded = true;
-          sendJson(res, 500, {
-            error: "Python process returned invalid JSON.",
-            details: err.message,
-            stdout: trimmedOutput,
-            stderr: stderrData.trim()
-          });
-        }
-      });
+      runPythonModel("python_models/predict_random_forest.py", requestPayload, res);
     });
 
     return;

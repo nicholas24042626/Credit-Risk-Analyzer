@@ -1,5 +1,6 @@
 const appState = {
   fileName: "",
+  file: null,
   model: "Decision Tree",
   uploaded: false
 };
@@ -60,6 +61,7 @@ function initApp() {
 
   function setFileState(file) {
     appState.fileName = file.name;
+    appState.file = file;
     appState.uploaded = true;
     selectedFileName.textContent = file.name;
     selectedFileMeta.textContent = formatFileMeta(file);
@@ -69,7 +71,7 @@ function initApp() {
 
   function renderMatrix(model) {
     matrixGrid.innerHTML = "";
-    const labels = ["Investment-High", "Investment-Low", "Speculative", "Distressed"];
+    const labels = modelData[model].labels || ["Investment-High", "Investment-Low", "Speculative", "Distressed"];
     const values = modelData[model].matrix;
 
     values.flat().forEach((value, index) => {
@@ -153,7 +155,10 @@ function initApp() {
   }
 
   function updateActionLabel() {
-    analyzeBtn.textContent = modelSelect.value === "Random Forest" ? "Predict" : "Run analysis";
+    analyzeBtn.textContent = modelSelect.value === "Random Forest" || modelSelect.value === "Decision Tree"
+      ? "Train / Predict"
+      : "Run analysis";
+    randomForestRatioForm.style.display = modelSelect.value === "Random Forest" ? "grid" : "none";
   }
 
   function getRandomForestPayload() {
@@ -168,6 +173,109 @@ function initApp() {
     }
 
     return payload;
+  }
+
+  function arrayBufferToBase64(buffer) {
+    let binary = "";
+    const bytes = new Uint8Array(buffer);
+    const chunkSize = 0x8000;
+
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, i + chunkSize);
+      binary += String.fromCharCode(...chunk);
+    }
+
+    return btoa(binary);
+  }
+
+  function readFileAsText(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(reader.error || new Error("Unable to read file."));
+      reader.readAsText(file);
+    });
+  }
+
+  function readFileAsArrayBuffer(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error("Unable to read file."));
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  async function buildDecisionTreePayload() {
+    if (!appState.file) {
+      throw new Error("Please upload a CSV or Excel file before training the Decision Tree.");
+    }
+
+    const fileName = appState.file.name || "dataset.csv";
+    const extension = fileName.split(".").pop().toLowerCase();
+
+    if (extension === "csv") {
+      const text = await readFileAsText(appState.file);
+      return {
+        fileName,
+        fileEncoding: "utf8",
+        fileData: text
+      };
+    }
+
+    const buffer = await readFileAsArrayBuffer(appState.file);
+    return {
+      fileName,
+      fileEncoding: "base64",
+      fileData: arrayBufferToBase64(buffer)
+    };
+  }
+
+  async function predictDecisionTree() {
+    let payload;
+
+    try {
+      payload = await buildDecisionTreePayload();
+    } catch (error) {
+      predictionResult.textContent = error.message;
+      predictionResult.className = "prediction-result error";
+      return;
+    }
+
+    analyzeBtn.disabled = true;
+    predictionResult.textContent = "Training Decision Tree on uploaded data...";
+    predictionResult.className = "prediction-result";
+
+    try {
+      const response = await fetch("/predict/decision-tree", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || "Decision Tree training failed.");
+      }
+
+      if (result.modelData) {
+        modelData["Decision Tree"] = result.modelData;
+      }
+
+      predictionResult.textContent = `Prediction: ${result.prediction}`;
+      predictionResult.className = "prediction-result success";
+      appState.model = "Decision Tree";
+      selectedModelTag.textContent = `Model: Decision Tree · Prediction: ${result.prediction}`;
+      renderMetrics("Decision Tree");
+      renderMatrix("Decision Tree");
+      renderShap("Decision Tree");
+      showScreen(resultsScreen);
+    } catch (error) {
+      predictionResult.textContent = error.message || "Unable to train the Decision Tree.";
+      predictionResult.className = "prediction-result error";
+    } finally {
+      analyzeBtn.disabled = false;
+    }
   }
 
   async function predictRandomForest() {
@@ -223,6 +331,10 @@ function initApp() {
   });
 
   analyzeBtn.addEventListener("click", () => {
+    if (modelSelect.value === "Decision Tree") {
+      predictDecisionTree();
+      return;
+    }
     if (modelSelect.value === "Random Forest") {
       predictRandomForest();
       return;
