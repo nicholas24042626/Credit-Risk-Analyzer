@@ -1,27 +1,57 @@
-window.MODEL_LIBRARY = window.MODEL_LIBRARY || {};
+const { spawn } = require("node:child_process");
+const path = require("node:path");
 
-window.MODEL_LIBRARY["XGBoost"] = {
-  tag: "XGBoost",
-  metrics: {
-    accuracy: "0.86",
-    precision: "0.85",
-    recall: "0.84",
-    f1: "0.84",
-    strength: "Captures complex interactions and usually performs strongest overall.",
-    weakness: "Can be harder to explain if the audience wants a simple rule trace."
-  },
-  matrix: [
-    [61, 2, 1, 0],
-    [3, 54, 2, 2],
-    [1, 2, 44, 2],
-    [0, 1, 3, 35]
-  ],
-  shap: [
-    ["Operating cash flow", 90],
-    ["Debt ratio", 82],
-    ["Current ratio", 79],
-    ["Return on capital employed", 68],
-    ["Gross profit margin", 59],
-    ["Sector", 46]
-  ]
-};
+/**
+ * Predict credit risk using the XGBoost Python model.
+ * 
+ * @param {Object} inputData - JSON object containing the financial ratios and Sector.
+ * @returns {Promise<Object>} - Promise resolving to { prediction: "...", probabilities: {...} }
+ */
+function predictXGBoost(inputData) {
+  return new Promise((resolve, reject) => {
+    // Path to the companion Python script
+    const scriptPath = path.join(__dirname, "predict_xgboost.py");
+    
+    // Use the virtual environment Python interpreter if available
+    const fs = require("node:fs");
+    const venvPath = path.join(__dirname, ".venv", "Scripts", "python.exe");
+    const pythonExecutable = fs.existsSync(venvPath) ? venvPath : "python";
+
+    // Spawn Python process, similar to the existing app.js structure
+    const pythonProcess = spawn(pythonExecutable, [scriptPath, JSON.stringify(inputData)], { windowsHide: true });
+    
+    let stdoutData = "";
+    let stderrData = "";
+
+    pythonProcess.stdout.on("data", (data) => { 
+      stdoutData += data.toString(); 
+    });
+    
+    pythonProcess.stderr.on("data", (data) => { 
+      stderrData += data.toString(); 
+    });
+
+    pythonProcess.on("error", (err) => {
+      reject(new Error(`Failed to start Python process: ${err.message}`));
+    });
+
+    pythonProcess.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Python process failed with exit code ${code}. Stderr: ${stderrData.trim()}`));
+        return;
+      }
+      try {
+        const parsedOutput = JSON.parse(stdoutData.trim());
+        if (parsedOutput.error) {
+            reject(new Error(`Python Error: ${parsedOutput.error}`));
+        } else {
+            resolve(parsedOutput);
+        }
+      } catch (err) {
+        reject(new Error(`Failed to parse Python output: ${err.message}. Stdout: ${stdoutData.trim()}`));
+      }
+    });
+  });
+}
+
+module.exports = { predictXGBoost };

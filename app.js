@@ -5,6 +5,7 @@ const { spawn } = require("node:child_process");
 
 const decisionTreeModel = require("./models/decisionTree");
 const randomForestModel = require("./models/randomForest");
+const xgboostModel = require("./models/xgboost"); // Import the XGBoost model configuration
 
 const root = __dirname;
 const port = Number(process.env.PORT || 3000);
