@@ -8,7 +8,7 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
-RESULTS_DIR = Path(r"C:\Users\24042662\Desktop\Main FYP\results")
+RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 class ExplicitLabelEncoder:
     def __init__(self, mapping):
