@@ -189,7 +189,7 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      runPythonModel("python_models/predict_random_forest.py", requestPayload, res);
+      runPythonModel("python_models/random_forest_stuff/predict_random_forest.py", requestPayload, res);
     });
 
     return;
