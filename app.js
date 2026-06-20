@@ -189,12 +189,8 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      // The Random Forest script loads its model artifacts from this folder.
-      runPythonModel(
-        "python_models/random_forest_stuff/predict_random_forest.py",
-        requestPayload,
-        res
-      );
+      // Keep the route path beside the Random Forest model configuration.
+      runPythonModel(randomForestModel.scriptPath, requestPayload, res);
     });
 
     return;

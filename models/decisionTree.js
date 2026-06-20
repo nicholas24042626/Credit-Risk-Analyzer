@@ -3,7 +3,7 @@
   const moduleExport = {
     name: "Decision Tree",
     route: "/predict/decision-tree",
-    scriptPath: "python_models/predict_decision_tree.py",
+    scriptPath: "python_models/decsion_tree_stuff/predict_decision_tree.py",
     data: model
   };
 
