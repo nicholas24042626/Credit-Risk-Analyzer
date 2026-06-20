@@ -1,0 +1,11 @@
+{
+  "name": "credit-risk-analyzer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Credit risk analysis UI with a Node server and view templates.",
+  "main": "app.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node app.js"
+  }
+}
