@@ -9,8 +9,6 @@ const randomForestModel = require("./models/randomForest");
 const root = __dirname;
 const port = Number(process.env.PORT || 3000);
 
-##
-
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
@@ -191,7 +189,7 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      runPythonModel("python_models/random_forest_stuff/predict_random_forest.py", requestPayload, res);
+      runPythonModel(randomForestModel.scriptPath, requestPayload, res);
     });
 
     return;
