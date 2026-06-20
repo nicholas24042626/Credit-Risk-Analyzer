@@ -33,11 +33,14 @@ def load_artifact(path):
 
 
 def parse_request_payload():
-    if len(sys.argv) < 2:
+    # Support both direct command-line tests and JSON sent by the Node server.
+    raw_payload = sys.argv[1] if len(sys.argv) > 1 else sys.stdin.read().strip()
+
+    if not raw_payload:
         fail("Missing JSON request argument.")
 
     try:
-        return json.loads(sys.argv[1])
+        return json.loads(raw_payload)
     except Exception as exc:
         fail("Invalid JSON request argument.", {"details": str(exc)})
 
