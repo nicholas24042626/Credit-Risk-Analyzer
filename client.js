@@ -95,12 +95,27 @@ function initApp() {
 
   function renderShap(model) {
     shapBars.innerHTML = "";
-    modelData[model].shap.forEach(([label, value], index) => {
+    modelData[model].shap.forEach((item, index) => {
+      const label = item[0];
+      const value = item[1];
+      const direction = item[2] !== undefined ? item[2] : 1;
+      
       const row = document.createElement("div");
       row.className = "bar-row";
+      
+      const barColorStyle = direction === -1 
+        ? 'background: linear-gradient(90deg, var(--accent-2), #ffa47a);' 
+        : 'background: linear-gradient(90deg, var(--accent), var(--accent-3));';
+        
+      const directionLabel = direction === -1 ? 'Pulls Away' : 'Pushes Toward';
+      const badgeStyle = direction === -1 ? 'color: var(--accent-2); font-weight: 500;' : 'color: var(--accent); font-weight: 500;';
+      
       row.innerHTML = `
-        <label>${label}</label>
-        <div class="bar-track"><div class="bar-fill" style="width: ${value}%; opacity: ${0.78 + index * 0.03};"></div></div>
+        <label style="display: flex; flex-direction: column; gap: 2px;">
+          <span>${label}</span>
+          <span style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; ${badgeStyle}">${directionLabel}</span>
+        </label>
+        <div class="bar-track"><div class="bar-fill" style="width: ${value}%; opacity: ${0.78 + index * 0.02}; ${barColorStyle}"></div></div>
         <strong>${value}%</strong>
       `;
       shapBars.appendChild(row);

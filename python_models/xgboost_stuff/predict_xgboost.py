@@ -1,6 +1,7 @@
 import sys
 import json
 import warnings
+import re
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -10,7 +11,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, con
 
 warnings.filterwarnings("ignore")
 
-RANDOM_STATE = 47
+RANDOM_STATE = 143
 
 class ExplicitLabelEncoder:
     def __init__(self, mapping):
@@ -155,7 +156,25 @@ def load_dataframe(input_data):
     raise FileNotFoundError("No file provided and default dataset not found.")
 
 def humanize_feature_name(name):
-    return name.replace("_log", "").replace("_sec_z", " (Sector Z-Score)").replace("_", " ").title()
+    is_log = "_log" in name
+    is_sec = "_sec_z" in name
+    
+    # Remove suffixes
+    base = name.replace("_log", "").replace("_sec_z", "")
+    
+    # Convert camelCase to spaces
+    base = re.sub(r'(?<!^)(?=[A-Z])', ' ', base)
+    base = base.replace("_", " ")
+    base = re.sub(r'\s+', ' ', base).strip()
+    
+    # Add readable suffix
+    suffix = ""
+    if is_log:
+        suffix += " (Log)"
+    if is_sec:
+        suffix += " (Sector Z-Score)"
+        
+    return f"{base.title()}{suffix}"
 
 def main():
     raw_payload = sys.argv[1] if len(sys.argv) > 1 else sys.stdin.read().strip()
@@ -208,6 +227,8 @@ def main():
             objective="multi:softprob",
             eval_metric="mlogloss",
             use_label_encoder=False,
+            subsample=0.7,
+            colsample_bytree=0.7,
             random_state=RANDOM_STATE,
             n_jobs=-1
         )
@@ -215,9 +236,9 @@ def main():
         # 2. Use a highly constrained grid to prevent XGBoost from overfitting
         # shallow trees (depth 3-5) generalize much better on small datasets
         param_grid = {
-            'max_depth': [3, 4, 5],
+            'max_depth': [3, 5],
             'learning_rate': [0.05, 0.1],
-            'n_estimators': [100, 150]
+            'n_estimators': [150, 300]
         }
         
         grid_search = GridSearchCV(
@@ -239,24 +260,60 @@ def main():
         precision, recall, f1, _ = precision_recall_fscore_support(y_test, pred_indices, average="weighted", zero_division=0)
         cm = confusion_matrix(y_test, pred_indices, labels=[0, 1, 2, 3])
         
-        # Calculate feature importance using the robust estimator
-        importances = best_xgb.feature_importances_
-        indices = np.argsort(importances)[::-1]
-        top_indices = indices[:6]
-        
-        shap_data = []
-        for i in top_indices:
-            fname = humanize_feature_name(X_train_enc.columns[i])
-            val = float(importances[i]) * 100
-            if val > 0:
-                shap_data.append([fname, round(val, 2)])
-                
-        if not shap_data:
-            shap_data = [["Feature", 100]]
-            
-        # Format results
+        # Calculate local SHAP values for the first test sample
         pred_labels = le.inverse_transform(pred_indices)
+        first_pred_class_idx = int(pred_indices[0])
         
+        try:
+            import shap
+            explainer = shap.TreeExplainer(best_xgb)
+            shap_values = explainer.shap_values(X_test_enc)
+            
+            if isinstance(shap_values, list):
+                sample_shap = shap_values[first_pred_class_idx][0]
+            elif isinstance(shap_values, np.ndarray):
+                if shap_values.ndim == 3:
+                    sample_shap = shap_values[0, :, first_pred_class_idx]
+                else:
+                    sample_shap = shap_values[0]
+            else:
+                sample_shap = best_xgb.feature_importances_
+        except Exception:
+            sample_shap = best_xgb.feature_importances_
+            
+        shap_df = pd.DataFrame({
+            "Feature": X_test_enc.columns,
+            "SHAP Value": sample_shap
+        })
+        shap_df["Abs SHAP Value"] = shap_df["SHAP Value"].abs()
+        shap_df = shap_df.sort_values("Abs SHAP Value", ascending=False).head(15)
+        
+        max_abs = shap_df["Abs SHAP Value"].max()
+        if max_abs > 0:
+            shap_df["Scaled Value"] = (shap_df["Abs SHAP Value"] / max_abs) * 95
+        else:
+            shap_df["Scaled Value"] = 0.0
+            
+        shap_data = []
+        positive_story = []
+        negative_story = []
+        
+        for _, row in shap_df.iterrows():
+            fname = humanize_feature_name(row["Feature"])
+            val = float(row["Scaled Value"])
+            raw_val = float(row["SHAP Value"])
+            direction = 1 if raw_val >= 0 else -1
+            
+            if val > 0:
+                shap_data.append([fname, round(val, 2), direction])
+                if direction == 1:
+                    positive_story.append(fname)
+                else:
+                    negative_story.append(fname)
+                    
+        if not shap_data:
+            shap_data = [["Feature", 100.0, 1]]
+            
         modelData = {
             "tag": "XGBoost",
             "labels": ["Investment-High", "Investment-Low", "Speculative", "Distressed"],
@@ -271,8 +328,8 @@ def main():
             "matrix": cm.tolist(),
             "shap": shap_data,
             "shapStory": {
-                "positive": [s[0] for s in shap_data[:3]] if len(shap_data) >= 3 else [],
-                "negative": [s[0] for s in shap_data[-3:]] if len(shap_data) >= 3 else []
+                "positive": positive_story[:3] if positive_story else ["No strong positive features"],
+                "negative": negative_story[:3] if negative_story else ["No strong negative features"]
             }
         }
         
