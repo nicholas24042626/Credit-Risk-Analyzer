@@ -46,7 +46,12 @@ function initApp() {
   const matrixGrid = document.getElementById("matrixGrid");
   const shapBars = document.getElementById("shapBars");
   const ratioInputs = document.querySelectorAll("[data-ratio-feature]");
+  const ratioForm = document.getElementById("ratioForm");
   const predictionResult = document.getElementById("predictionResult");
+
+  function formatPredictionLabel(label) {
+    return String(label).replace(/_/g, "-");
+  }
 
   function showScreen(screen) {
     [uploadScreen, modelScreen, resultsScreen].forEach((node) => node.classList.remove("active"));
@@ -155,21 +160,31 @@ function initApp() {
   }
 
   function updateActionLabel() {
-    analyzeBtn.textContent = modelSelect.value === "Random Forest" || modelSelect.value === "Decision Tree"
+    const usesRatioForm = modelSelect.value === "Random Forest" || modelSelect.value === "XGBoost";
+    analyzeBtn.textContent = modelSelect.value === "Decision Tree" || usesRatioForm
       ? "Train / Predict"
       : "Run analysis";
-    randomForestRatioForm.style.display = modelSelect.value === "Random Forest" ? "grid" : "none";
+    ratioForm.style.display = usesRatioForm ? "grid" : "none";
   }
 
-  function getRandomForestPayload() {
+  function getRatioPayload() {
     const payload = {};
 
     for (const input of ratioInputs) {
+      const fieldName = input.dataset.ratioFeature;
+      if (input.tagName === "SELECT") {
+        if (!input.value) {
+          throw new Error("Sector is required for ratio-based predictions.");
+        }
+        payload[fieldName] = input.value;
+        continue;
+      }
+
       const value = Number(input.value);
       if (!Number.isFinite(value)) {
         throw new Error(`${input.labels[0]?.textContent || input.name} must be a number.`);
       }
-      payload[input.dataset.ratioFeature] = value;
+      payload[fieldName] = value;
     }
 
     return payload;
@@ -282,7 +297,7 @@ function initApp() {
     let payload;
 
     try {
-      payload = getRandomForestPayload();
+      payload = getRatioPayload();
     } catch (error) {
       predictionResult.textContent = error.message;
       predictionResult.className = "prediction-result error";
@@ -305,10 +320,49 @@ function initApp() {
         throw new Error(result.error || "Random Forest prediction failed.");
       }
 
-      predictionResult.textContent = `Prediction: ${result.prediction}`;
+      predictionResult.textContent = `Prediction: ${formatPredictionLabel(result.prediction)}`;
       predictionResult.className = "prediction-result success";
       runAnalysis();
-      selectedModelTag.textContent = `Model: Random Forest · Prediction: ${result.prediction}`;
+      selectedModelTag.textContent = `Model: Random Forest · Prediction: ${formatPredictionLabel(result.prediction)}`;
+    } catch (error) {
+      predictionResult.textContent = error.message || "Unable to get a prediction.";
+      predictionResult.className = "prediction-result error";
+    } finally {
+      analyzeBtn.disabled = false;
+    }
+  }
+
+  async function predictXgboost() {
+    let payload;
+
+    try {
+      payload = getRatioPayload();
+    } catch (error) {
+      predictionResult.textContent = error.message;
+      predictionResult.className = "prediction-result error";
+      return;
+    }
+
+    analyzeBtn.disabled = true;
+    predictionResult.textContent = "Running XGBoost prediction…";
+    predictionResult.className = "prediction-result";
+
+    try {
+      const response = await fetch("/predict/xgboost", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || "XGBoost prediction failed.");
+      }
+
+      predictionResult.textContent = `Prediction: ${formatPredictionLabel(result.prediction)}`;
+      predictionResult.className = "prediction-result success";
+      runAnalysis();
+      selectedModelTag.textContent = `Model: XGBoost · Prediction: ${formatPredictionLabel(result.prediction)}`;
     } catch (error) {
       predictionResult.textContent = error.message || "Unable to get a prediction.";
       predictionResult.className = "prediction-result error";
@@ -337,6 +391,10 @@ function initApp() {
     }
     if (modelSelect.value === "Random Forest") {
       predictRandomForest();
+      return;
+    }
+    if (modelSelect.value === "XGBoost") {
+      predictXgboost();
       return;
     }
     if (!appState.uploaded) return;

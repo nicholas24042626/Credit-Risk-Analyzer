@@ -786,9 +786,25 @@
                   <button class="button" id="analyzeBtn" type="button">Run analysis</button>
                 </div>
                 <p class="panel-copy" style="margin-top: 14px;">
-                  Random Forest uses the 25 financial ratios below. Other model options retain the existing dashboard flow.
+                  Random Forest and XGBoost use the financial ratios below. XGBoost also requires sector for sector-adjusted features.
                 </p>
-                <div class="ratio-form" id="randomForestRatioForm">
+                <div class="ratio-form" id="ratioForm">
+                  <label class="ratio-field">Sector
+                    <select data-ratio-feature="Sector">
+                      <option value="Basic Industries">Basic Industries</option>
+                      <option value="Capital Goods">Capital Goods</option>
+                      <option value="Consumer Durables" selected>Consumer Durables</option>
+                      <option value="Consumer Non-Durables">Consumer Non-Durables</option>
+                      <option value="Consumer Services">Consumer Services</option>
+                      <option value="Energy">Energy</option>
+                      <option value="Finance">Finance</option>
+                      <option value="Health Care">Health Care</option>
+                      <option value="Miscellaneous">Miscellaneous</option>
+                      <option value="Public Utilities">Public Utilities</option>
+                      <option value="Technology">Technology</option>
+                      <option value="Transportation">Transportation</option>
+                    </select>
+                  </label>
                   <label class="ratio-field">Current ratio<input data-ratio-feature="currentRatio" type="number" step="any" value="2.1" /></label>
                   <label class="ratio-field">Quick ratio<input data-ratio-feature="quickRatio" type="number" step="any" value="1.5" /></label>
                   <label class="ratio-field">Cash ratio<input data-ratio-feature="cashRatio" type="number" step="any" value="0.8" /></label>

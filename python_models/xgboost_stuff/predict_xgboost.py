@@ -24,6 +24,21 @@ le = ExplicitLabelEncoder({
     "Distressed": 3,
 })
 
+def format_prediction_label(label):
+    return str(label).replace("_", "-")
+
+def load_prediction_strategy():
+    strategy_path = RESULTS_DIR / "prediction_strategy.pkl"
+    if not strategy_path.exists():
+        return {"use_thresholds": False}
+    return joblib.load(strategy_path)
+
+def resolve_prediction(proba, pred_indices, strategy, optimal_thresholds=None):
+    if strategy.get("use_thresholds") and optimal_thresholds is not None:
+        adjusted = proba * optimal_thresholds
+        return adjusted.argmax(axis=1)
+    return pred_indices
+
 def winsorize_features(X_fit, X_target, bounds=None, lower_pct=1, upper_pct=99):
     X_out = X_target.copy()
     numerics_target = [c for c in X_out.select_dtypes(include='number').columns if c in bounds["lower"].index]
@@ -111,19 +126,22 @@ def main():
         
         proba = calibrated_model.predict_proba(df_in_enc)
         pred = calibrated_model.predict(df_in_enc)
-        
-        # Optional threshold adjustment
-        try:
-            optimal_thresholds = joblib.load(RESULTS_DIR / "optimal_thresholds.pkl")
-            y_proba_adjusted = proba * optimal_thresholds
-            pred_threshold = y_proba_adjusted.argmax(axis=1)
-            pred_labels = le.inverse_transform(pred_threshold)
-        except Exception:
-            pred_labels = le.inverse_transform(pred)
-        
+        strategy = load_prediction_strategy()
+        optimal_thresholds = None
+
+        thresholds_path = RESULTS_DIR / "optimal_thresholds.pkl"
+        if thresholds_path.exists():
+            optimal_thresholds = joblib.load(thresholds_path)
+
+        pred_indices = resolve_prediction(proba, pred, strategy, optimal_thresholds)
+        pred_labels = le.inverse_transform(pred_indices)
+
         result = {
-            "prediction": str(pred_labels[0]),
-            "probabilities": {str(le.classes_[i]): float(proba[0][i]) for i in range(len(le.classes_))}
+            "prediction": format_prediction_label(pred_labels[0]),
+            "probabilities": {
+                format_prediction_label(le.classes_[i]): float(proba[0][i])
+                for i in range(len(le.classes_))
+            }
         }
         
         print(json.dumps(result))
