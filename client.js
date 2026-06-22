@@ -160,11 +160,16 @@ function initApp() {
   }
 
   function updateActionLabel() {
-    const usesRatioForm = modelSelect.value === "Random Forest" || modelSelect.value === "XGBoost";
-    analyzeBtn.textContent = modelSelect.value === "Decision Tree" || usesRatioForm
-      ? "Train / Predict"
-      : "Run analysis";
-    ratioForm.style.display = usesRatioForm ? "grid" : "none";
+    if (modelSelect.value === "Decision Tree" || modelSelect.value === "XGBoost") {
+      analyzeBtn.textContent = "Train / Predict";
+      ratioForm.style.display = "none";
+    } else if (modelSelect.value === "Random Forest") {
+      analyzeBtn.textContent = "Predict";
+      ratioForm.style.display = "grid";
+    } else {
+      analyzeBtn.textContent = "Run analysis";
+      ratioForm.style.display = "none";
+    }
   }
 
   function getRatioPayload() {
@@ -277,10 +282,10 @@ function initApp() {
         modelData["Decision Tree"] = result.modelData;
       }
 
-      predictionResult.textContent = `Prediction: ${result.prediction}`;
+      predictionResult.textContent = `Model trained and dataset evaluated successfully.`;
       predictionResult.className = "prediction-result success";
       appState.model = "Decision Tree";
-      selectedModelTag.textContent = `Model: Decision Tree · Prediction: ${result.prediction}`;
+      selectedModelTag.textContent = `Model: Decision Tree · Dataset Evaluated`;
       renderMetrics("Decision Tree");
       renderMatrix("Decision Tree");
       renderShap("Decision Tree");
@@ -336,7 +341,7 @@ function initApp() {
     let payload;
 
     try {
-      payload = getRatioPayload();
+      payload = await buildDecisionTreePayload();
     } catch (error) {
       predictionResult.textContent = error.message;
       predictionResult.className = "prediction-result error";
@@ -344,7 +349,7 @@ function initApp() {
     }
 
     analyzeBtn.disabled = true;
-    predictionResult.textContent = "Running XGBoost prediction…";
+    predictionResult.textContent = "Running XGBoost prediction on uploaded data…";
     predictionResult.className = "prediction-result";
 
     try {
@@ -359,10 +364,18 @@ function initApp() {
         throw new Error(result.error || "XGBoost prediction failed.");
       }
 
-      predictionResult.textContent = `Prediction: ${formatPredictionLabel(result.prediction)}`;
+      if (result.modelData) {
+        modelData["XGBoost"] = result.modelData;
+      }
+
+      predictionResult.textContent = `Dataset evaluated successfully.`;
       predictionResult.className = "prediction-result success";
-      runAnalysis();
-      selectedModelTag.textContent = `Model: XGBoost · Prediction: ${formatPredictionLabel(result.prediction)}`;
+      appState.model = "XGBoost";
+      selectedModelTag.textContent = `Model: XGBoost · Dataset Evaluated`;
+      renderMetrics("XGBoost");
+      renderMatrix("XGBoost");
+      renderShap("XGBoost");
+      showScreen(resultsScreen);
     } catch (error) {
       predictionResult.textContent = error.message || "Unable to get a prediction.";
       predictionResult.className = "prediction-result error";

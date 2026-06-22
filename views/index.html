@@ -724,11 +724,12 @@
               <div id="dropzone" class="dropzone" role="button" tabindex="0" aria-label="Upload Excel file">
                 <div class="file-blob">^</div>
                 <h3>Drag and drop your file here</h3>
-                <p>or choose an Excel sheet from your device. The next page will open automatically after upload.</p>
+                <p>or choose an Excel sheet from your device. Decision Tree and XGBoost use this file for predictions.</p>
                 <div class="btn-row">
                   <button class="button" id="browseBtn" type="button">Browse file</button>
                   <button class="button-secondary" id="continueBtn" type="button" disabled>Continue</button>
                 </div>
+
                 <input id="fileInput" type="file" accept=".csv,.xls,.xlsx" hidden />
               </div>
             </div>
@@ -786,9 +787,9 @@
                   <button class="button" id="analyzeBtn" type="button">Run analysis</button>
                 </div>
                 <p class="panel-copy" style="margin-top: 14px;">
-                  Random Forest and XGBoost use the financial ratios below. XGBoost also requires sector for sector-adjusted features.
+                  Random Forest uses the financial ratios below. Decision Tree and XGBoost use the uploaded file.
                 </p>
-                <div class="ratio-form" id="ratioForm">
+                <div class="ratio-form" id="ratioForm" style="display: none;">
                   <label class="ratio-field">Sector
                     <select data-ratio-feature="Sector">
                       <option value="Basic Industries">Basic Industries</option>

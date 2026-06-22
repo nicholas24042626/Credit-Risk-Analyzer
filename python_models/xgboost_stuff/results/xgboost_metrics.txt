@@ -1,6 +1,6 @@
 XGBoost Model Evaluation Metrics (XGBoost Only)
 ----------------------------------------
-accuracy: 0.6232
-balanced_accuracy: 0.7212
-f1_macro: 0.5020
-roc_auc_ovr: 0.8646
+accuracy: 0.6675
+balanced_accuracy: 0.4959
+f1_macro: 0.4924
+roc_auc_ovr: 0.8637
