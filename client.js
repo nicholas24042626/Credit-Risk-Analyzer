@@ -123,7 +123,23 @@ function initApp() {
 
   function renderShap(model) {
     shapBars.innerHTML = "";
-    const shapValues = modelData[model]?.shap || [];
+    const shapValues = (modelData[model]?.featureImportance || modelData[model]?.shap || [])
+      .map((item) => {
+        if (Array.isArray(item)) {
+          return {
+            feature: item[0],
+            value: Number(item[1]) || 0,
+            effect: item[2] || null
+          };
+        }
+
+        return {
+          feature: item.feature,
+          value: Number(item.importance ?? item.value) || 0,
+          effect: item.effect || null
+        };
+      })
+      .filter((item) => item.feature);
 
     if (!shapValues.length) {
       shapBars.innerHTML = `
@@ -140,28 +156,58 @@ function initApp() {
       return;
     }
 
-    shapValues.forEach((item, index) => {
-      const label = item[0];
-      const value = item[1];
-      const direction = item[2] !== undefined ? item[2] : 1;
-      
+    const rankedValues = shapValues
+      .map((item) => ({
+        ...item,
+        absValue: Math.abs(item.value)
+      }))
+      .sort((left, right) => right.absValue - left.absValue)
+      .slice(0, 8);
+
+    const maxValue = rankedValues[0]?.absValue || 0;
+    const totalValue = rankedValues.reduce((sum, item) => sum + item.absValue, 0) || 1;
+    const topItem = rankedValues[0];
+    const secondItem = rankedValues[1];
+
+    if (topItem) {
+      const topShare = Math.round((topItem.absValue / totalValue) * 100);
+      const runnerUpShare = secondItem ? Math.round((secondItem.absValue / topItem.absValue) * 100) : null;
+      const closenessNote = runnerUpShare && runnerUpShare >= 85
+        ? ` The next strongest feature is very close at ${runnerUpShare}% of the top driver.`
+        : "";
+      shapSummary.textContent = `Top SHAP driver for ${model}: ${topItem.feature} (${topShare}% of total displayed impact).${closenessNote}`;
+    }
+
+    rankedValues.forEach((item, index) => {
+      const label = item.feature;
+      const value = item.absValue;
+      const direction = item.effect && item.effect.toLowerCase().includes("away") ? -1 : 1;
+      const relativeWidth = maxValue ? (value / maxValue) * 100 : 0;
+      const relativeStrength = maxValue ? Math.round((value / maxValue) * 100) : 0;
+
       const row = document.createElement("div");
       row.className = "bar-row";
-      
-      const barColorStyle = direction === -1 
-        ? 'background: linear-gradient(90deg, var(--accent-2), #ffa47a);' 
-        : 'background: linear-gradient(90deg, var(--accent), var(--accent-3));';
-        
-      const directionLabel = direction === -1 ? 'Pulls Away' : 'Pushes Toward';
-      const badgeStyle = direction === -1 ? 'color: var(--accent-2); font-weight: 500;' : 'color: var(--accent); font-weight: 500;';
+
+      const barColorStyle = direction === -1
+        ? "background: linear-gradient(90deg, var(--accent-2), #ffa47a);"
+        : "background: linear-gradient(90deg, var(--accent), var(--accent-3));";
+
+      const directionLabel = direction === -1 ? "Pulls Away" : "Pushes Toward";
+      const badgeStyle = direction === -1
+        ? "color: var(--accent-2); font-weight: 600;"
+        : "color: var(--accent); font-weight: 600;";
+      const isTop = index === 0;
+      const emphasisStyle = isTop
+        ? "font-weight: 700; color: var(--text);"
+        : "font-weight: 500;";
       
       row.innerHTML = `
         <label style="display: flex; flex-direction: column; gap: 2px;">
-          <span>${label}</span>
+          <span style="${emphasisStyle}">${label}${isTop ? ' <span style="margin-left: 6px; padding: 2px 8px; border-radius: 999px; background: rgba(0,184,169,0.14); color: var(--accent); font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;">Top driver</span>' : ''}</span>
           <span style="font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; ${badgeStyle}">${directionLabel}</span>
         </label>
-        <div class="bar-track"><div class="bar-fill" style="width: ${value}%; opacity: ${0.78 + index * 0.02}; ${barColorStyle}"></div></div>
-        <strong>${value}%</strong>
+        <div class="bar-track"><div class="bar-fill" style="width: ${relativeWidth}%; opacity: ${isTop ? 1 : Math.max(0.55, 0.92 - index * 0.05)}; ${barColorStyle}"></div></div>
+        <strong>${value.toFixed(4)}%<br><span style="font-size: 0.68rem; font-weight: 600; color: var(--accent);">${isTop ? "100% of top" : `${relativeStrength}% of top`}</span></strong>
       `;
       shapBars.appendChild(row);
     });
@@ -179,7 +225,7 @@ function initApp() {
       shapNarrative.innerHTML = `
         <h5>Why this class was predicted</h5>
         <p>
-          The SHAP plot shows which financial ratios pushed the company toward the selected risk class and which ones pulled away.
+          The SHAP plot now ranks the strongest financial drivers first, so the most influential column is easier to spot.
         </p>
       `;
     }
