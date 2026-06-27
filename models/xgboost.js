@@ -17,7 +17,12 @@
         const pythonExecutable = fs.existsSync(venvPath) ? venvPath : "python";
 
         // Spawn Python process, similar to the existing app.js structure
-        const pythonProcess = spawn(pythonExecutable, [scriptPath, JSON.stringify(inputData)], { windowsHide: true });
+        const pythonProcess = spawn(pythonExecutable, [scriptPath], { windowsHide: true });
+        
+        if (pythonProcess.stdin) {
+            pythonProcess.stdin.write(JSON.stringify(inputData));
+            pythonProcess.stdin.end();
+        }
         
         let stdoutData = "";
         let stderrData = "";
