@@ -96,11 +96,21 @@ function runPythonModel(scriptRelativePath, requestPayload, res) {
     }
 
     if (code !== 0) {
+      let stderrPayload = null;
+      const trimmedStderr = stderrData.trim();
+
+      try {
+        stderrPayload = trimmedStderr ? JSON.parse(trimmedStderr) : null;
+      } catch (err) {
+        stderrPayload = null;
+      }
+
       hasResponded = true;
       sendJson(res, 500, {
-        error: "Python prediction process failed.",
+        error: stderrPayload?.error || "Python prediction process failed.",
         exitCode: code,
-        stderr: stderrData.trim() || "No error output was provided."
+        details: stderrPayload?.details,
+        stderr: stderrPayload ? undefined : trimmedStderr || "No error output was provided."
       });
       return;
     }

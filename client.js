@@ -53,6 +53,19 @@ function initApp() {
     return String(label).replace(/_/g, "-");
   }
 
+  function getBackendErrorMessage(result, fallback) {
+    if (!result || typeof result !== "object") {
+      return fallback;
+    }
+
+    const parts = [result.error, result.details, result.stderr].filter(Boolean);
+    if (!parts.length) {
+      return fallback;
+    }
+
+    return parts.join(" ");
+  }
+
   function showScreen(screen) {
     [uploadScreen, modelScreen, resultsScreen].forEach((node) => node.classList.remove("active"));
     screen.classList.add("active");
@@ -76,12 +89,26 @@ function initApp() {
 
   function renderMatrix(model) {
     matrixGrid.innerHTML = "";
-    const labels = modelData[model].labels || ["Investment-High", "Investment-Low", "Speculative", "Distressed"];
-    const values = modelData[model].matrix;
+    const values = modelData[model]?.matrix || [];
+    const labels = modelData[model]?.labels || values.map((_, index) => `Class ${index + 1}`);
+
+    if (!values.length) {
+      matrixGrid.style.gridTemplateColumns = "1fr";
+      matrixGrid.innerHTML = `
+        <div class="cell">
+          <strong>-</strong>
+          <span>Train the model to generate a confusion matrix.</span>
+        </div>
+      `;
+      return;
+    }
+
+    const columnCount = labels.length || values.length || 1;
+    matrixGrid.style.gridTemplateColumns = `repeat(${columnCount}, minmax(0, 1fr))`;
 
     values.flat().forEach((value, index) => {
-      const row = Math.floor(index / 4);
-      const col = index % 4;
+      const row = Math.floor(index / columnCount);
+      const col = index % columnCount;
       const cell = document.createElement("div");
       cell.className = "cell";
       if (row === col) cell.classList.add("diag");
@@ -95,7 +122,24 @@ function initApp() {
 
   function renderShap(model) {
     shapBars.innerHTML = "";
-    modelData[model].shap.forEach((item, index) => {
+    const shapValues = modelData[model]?.shap || [];
+
+    if (!shapValues.length) {
+      shapBars.innerHTML = `
+        <div class="bar-row">
+          <label>Train the model to generate feature importance.</label>
+          <div class="bar-track"><div class="bar-fill" style="width: 0%;"></div></div>
+          <strong>-</strong>
+        </div>
+      `;
+      shapNarrative.innerHTML = `
+        <h5>Why this class was predicted</h5>
+        <p>Feature importance appears after the model is trained on the uploaded dataset.</p>
+      `;
+      return;
+    }
+
+    shapValues.forEach((item, index) => {
       const label = item[0];
       const value = item[1];
       const direction = item[2] !== undefined ? item[2] : 1;
@@ -121,7 +165,7 @@ function initApp() {
       shapBars.appendChild(row);
     });
 
-    const story = modelData[model].shapStory;
+    const story = modelData[model]?.shapStory;
     if (story) {
       shapNarrative.innerHTML = `
         <h5>Why this class was predicted</h5>
@@ -141,7 +185,33 @@ function initApp() {
   }
 
   function renderMetrics(model) {
-    const metrics = modelData[model].metrics;
+    const metrics = modelData[model]?.metrics;
+
+    if (!metrics) {
+      performanceStats.innerHTML = `
+        <div class="mini-card">
+          <h5>Accuracy</h5>
+          <p>-</p>
+        </div>
+        <div class="mini-card">
+          <h5>Precision</h5>
+          <p>-</p>
+        </div>
+        <div class="mini-card">
+          <h5>Recall</h5>
+          <p>-</p>
+        </div>
+        <div class="mini-card">
+          <h5>F1-score</h5>
+          <p>-</p>
+        </div>
+      `;
+      performanceStrength.textContent = "Train the model to calculate metrics from the uploaded dataset.";
+      performanceWeakness.textContent = "No static Random Forest metrics are shown before training.";
+      shapSummary.textContent = `Feature importance for ${model} appears after training.`;
+      return;
+    }
+
     performanceStats.innerHTML = `
       <div class="mini-card">
         <h5>Accuracy</h5>
@@ -175,12 +245,9 @@ function initApp() {
   }
 
   function updateActionLabel() {
-    if (modelSelect.value === "Decision Tree" || modelSelect.value === "XGBoost") {
+    if (modelSelect.value === "Decision Tree" || modelSelect.value === "Random Forest" || modelSelect.value === "XGBoost") {
       analyzeBtn.textContent = "Train / Predict";
       ratioForm.style.display = "none";
-    } else if (modelSelect.value === "Random Forest") {
-      analyzeBtn.textContent = "Predict";
-      ratioForm.style.display = "grid";
     } else {
       analyzeBtn.textContent = "Run analysis";
       ratioForm.style.display = "none";
@@ -243,7 +310,7 @@ function initApp() {
 
   async function buildDecisionTreePayload() {
     if (!appState.file) {
-      throw new Error("Please upload a CSV or Excel file before training the Decision Tree.");
+      throw new Error("Please upload a CSV or Excel file before training a model.");
     }
 
     const fileName = appState.file.name || "dataset.csv";
@@ -317,7 +384,7 @@ function initApp() {
     let payload;
 
     try {
-      payload = getRatioPayload();
+      payload = await buildDecisionTreePayload();
     } catch (error) {
       predictionResult.textContent = error.message;
       predictionResult.className = "prediction-result error";
@@ -325,7 +392,7 @@ function initApp() {
     }
 
     analyzeBtn.disabled = true;
-    predictionResult.textContent = "Running Random Forest prediction…";
+    predictionResult.textContent = "Training Random Forest on uploaded data...";
     predictionResult.className = "prediction-result";
 
     try {
@@ -337,12 +404,20 @@ function initApp() {
       const result = await response.json();
 
       if (!response.ok) {
-        throw new Error(result.error || "Random Forest prediction failed.");
+        throw new Error(getBackendErrorMessage(result, "Random Forest prediction failed."));
       }
 
-      predictionResult.textContent = `Prediction: ${formatPredictionLabel(result.prediction)}`;
+      if (result.modelData) {
+        modelData["Random Forest"] = result.modelData;
+      }
+
+      predictionResult.textContent = "Model trained and dataset evaluated successfully.";
       predictionResult.className = "prediction-result success";
-      runAnalysis();
+      appState.model = "Random Forest";
+      renderMetrics("Random Forest");
+      renderMatrix("Random Forest");
+      renderShap("Random Forest");
+      showScreen(resultsScreen);
       selectedModelTag.textContent = `Model: Random Forest · Prediction: ${formatPredictionLabel(result.prediction)}`;
     } catch (error) {
       predictionResult.textContent = error.message || "Unable to get a prediction.";

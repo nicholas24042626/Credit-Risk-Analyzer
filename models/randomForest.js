@@ -3,31 +3,15 @@
     name: "Random Forest",
     route: "/predict/random-forest",
     scriptPath: "python_models/random_forest_stuff/predict_random_forest.py",
-    description: "Runs the Python-trained Random Forest credit risk predictor.",
+    description: "Trains and evaluates a Random Forest credit risk predictor from the uploaded dataset.",
     data: {
       tag: "Random Forest",
-      metrics: {
-        accuracy: "0.66",
-        precision: "0.66",
-        recall: "0.66",
-        f1: "0.65",
-        strength: "Captures non-linear relationships across the financial ratios.",
-        weakness: "Performance can vary across the smaller credit-risk classes."
-      },
-      matrix: [
-        [89, 43, 16, 0],
-        [39, 114, 48, 0],
-        [10, 29, 198, 1],
-        [1, 0, 19, 2]
-      ],
-      shap: [
-        ["Current ratio", 89],
-        ["Debt-to-equity ratio", 81],
-        ["Net profit margin", 74],
-        ["Return on assets", 67],
-        ["Operating cash flow / sales", 61],
-        ["Enterprise value multiple", 52]
-      ]
+      trained: false,
+      metrics: null,
+      labels: [],
+      matrix: [],
+      shap: [],
+      shapStory: null
     }
   };
 
