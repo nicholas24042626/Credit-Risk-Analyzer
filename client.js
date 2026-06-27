@@ -14,8 +14,8 @@ const ratingRuleEngine = {
   "BBB": "Investment-Low",
   "BB": "Speculative",
   "B": "Speculative",
-  "CCC": "Distressed",
-  "CC": "Distressed",
+  "CCC": "Speculative",
+  "CC": "Speculative",
   "C": "Distressed",
   "D": "Distressed"
 };

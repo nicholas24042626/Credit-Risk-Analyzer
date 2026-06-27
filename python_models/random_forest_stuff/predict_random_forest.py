@@ -53,15 +53,24 @@ def fail(message, details=None, status=1):
 
 
 def group_rating(rating):
+    """Collapse granular credit ratings into four financial risk tiers.
+
+    Investment_High : AAA, AA, A
+    Investment_Low  : BBB
+    Speculative     : BB, B, CCC, CC
+    Distressed      : C, D
+    """
+    rating = str(rating).strip().upper()
     if rating in ["AAA", "AA", "A"]:
         return "Investment-High"
-    if rating == "BBB":
+    elif rating == "BBB":
         return "Investment-Low"
-    if rating in ["BB", "B"]:
+    elif rating in ["BB", "B", "CCC", "CC"]:
         return "Speculative"
-    if rating in ["CCC", "CC", "C", "D"]:
+    elif rating in ["C", "D"]:
         return "Distressed"
-    return "Unknown"
+    else:
+        return "Unknown"
 
 
 def humanize_feature_name(name):

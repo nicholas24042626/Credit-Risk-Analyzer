@@ -1,6 +1,11 @@
 (function (root, factory) {
   const model = factory();
-  const moduleExport = model;
+  const moduleExport = {
+    name: "Decision Tree",
+    route: "/predict/decision-tree",
+    scriptPath: "python_models/decision_tree_stuff/predict_decision_tree.py",
+    data: model
+  };
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = moduleExport;
@@ -12,8 +17,12 @@
   }
 })(typeof window !== "undefined" ? window : globalThis, function () {
   return {
-    name: "Decision Tree",
-    route: "/predict/decision-tree",
-    scriptPath: "python_models/decision_tree_stuff/predict_decision_tree.py"
+    tag: "Decision Tree",
+    trained: false,
+    metrics: null,
+    labels: [],
+    matrix: [],
+    shap: [],
+    shapStory: null
   };
 });

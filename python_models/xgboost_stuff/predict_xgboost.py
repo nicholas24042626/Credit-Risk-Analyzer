@@ -33,11 +33,24 @@ def format_prediction_label(label):
     return str(label).replace("_", "-")
 
 def group_rating(r):
-    if r in ["AAA", "AA", "A"]: return "Investment_High"
-    if r == "BBB": return "Investment_Low"
-    if r in ["BB", "B"]: return "Speculative"
-    if r in ["CCC", "CC", "C", "D"]: return "Distressed"
-    return "Unknown"
+    """Collapse granular credit ratings into four financial risk tiers.
+
+    Investment_High : AAA, AA, A
+    Investment_Low  : BBB
+    Speculative     : BB, B, CCC, CC
+    Distressed      : C, D
+    """
+    r = str(r).strip().upper()
+    if r in ["AAA", "AA", "A"]:
+        return "Investment_High"
+    elif r == "BBB":
+        return "Investment_Low"
+    elif r in ["BB", "B", "CCC", "CC"]:
+        return "Speculative"
+    elif r in ["C", "D"]:
+        return "Distressed"
+    else:
+        return "Unknown"
 
 def winsorize_features(X_train, X_test, lower_pct=1, upper_pct=99):
     X_train_out, X_test_out = X_train.copy(), X_test.copy()
