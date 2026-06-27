@@ -6,17 +6,17 @@
   <title>CreditSight</title>
   <style>
     :root {
-      --bg: #f7fbff;
-      --panel: rgba(255, 255, 255, 0.9);
+      --bg: #fbfdff;
+      --panel: rgba(255, 255, 255, 0.94);
       --panel-strong: rgba(255, 255, 255, 0.96);
-      --line: rgba(57, 96, 139, 0.16);
-      --text: #14324d;
-      --muted: #5d748b;
-      --accent: #00b8a9;
-      --accent-2: #ff8a4c;
-      --accent-3: #3b82f6;
+      --line: rgba(37, 99, 235, 0.16);
+      --text: #12304a;
+      --muted: #5c7185;
+      --accent: #14c8a8;
+      --accent-2: #ff9f43;
+      --accent-3: #4f8df7;
       --danger: #e5486d;
-      --shadow: 0 26px 70px rgba(55, 94, 128, 0.18);
+      --shadow: 0 26px 70px rgba(79, 141, 247, 0.16);
       --radius-xl: 28px;
       --radius-lg: 20px;
       --radius-md: 16px;
@@ -30,10 +30,10 @@
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(circle at top left, rgba(0, 184, 169, 0.18), transparent 28%),
-        radial-gradient(circle at 80% 10%, rgba(59, 130, 246, 0.16), transparent 24%),
-        radial-gradient(circle at 90% 80%, rgba(255, 138, 76, 0.16), transparent 22%),
-        linear-gradient(135deg, #f8fdff 0%, #eef8ff 46%, #fff9f3 100%);
+        radial-gradient(circle at top left, rgba(20, 200, 168, 0.22), transparent 28%),
+        radial-gradient(circle at 80% 10%, rgba(79, 141, 247, 0.18), transparent 24%),
+        radial-gradient(circle at 92% 82%, rgba(255, 210, 82, 0.26), transparent 23%),
+        linear-gradient(135deg, #ffffff 0%, #f0fbff 42%, #fff8e7 100%);
       overflow-x: hidden;
     }
 
@@ -57,7 +57,7 @@
       padding: 18px;
       border: 1px solid var(--line);
       border-radius: 36px;
-      background: rgba(255, 255, 255, 0.72);
+      background: rgba(255, 255, 255, 0.82);
       box-shadow: var(--shadow);
       backdrop-filter: blur(18px);
     }
@@ -79,22 +79,22 @@
     }
 
     .brand-mark {
-      width: 52px;
-      height: 52px;
+      width: 58px;
+      height: 58px;
       border-radius: 18px;
-      background: linear-gradient(145deg, rgba(0, 184, 169, 0.95), rgba(59, 130, 246, 0.9));
-      box-shadow: 0 16px 30px rgba(0, 184, 169, 0.22);
+      background: #ffffff;
+      box-shadow: 0 16px 30px rgba(15, 45, 128, 0.16);
       position: relative;
       overflow: hidden;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(37, 99, 235, 0.12);
     }
 
-    .brand-mark::after {
-      content: "";
-      position: absolute;
-      inset: 11px;
-      border: 2px solid rgba(255,255,255,0.65);
-      border-radius: 13px;
-      transform: rotate(12deg);
+    .brand-mark svg {
+      width: 48px;
+      height: 48px;
+      display: block;
     }
 
     .brand h1 {
@@ -134,7 +134,7 @@
     .workspace {
       border: 1px solid var(--line);
       border-radius: var(--radius-xl);
-      background: linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(242, 249, 255, 0.94));
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(240, 251, 255, 0.96));
       overflow: hidden;
     }
 
@@ -149,9 +149,9 @@
       position: absolute;
       inset: 0;
       background:
-        radial-gradient(circle at 20% 20%, rgba(0, 184, 169, 0.18), transparent 22%),
-        radial-gradient(circle at 80% 22%, rgba(255, 138, 76, 0.14), transparent 24%),
-        radial-gradient(circle at 50% 90%, rgba(59, 130, 246, 0.14), transparent 22%);
+        radial-gradient(circle at 20% 20%, rgba(20, 200, 168, 0.22), transparent 22%),
+        radial-gradient(circle at 80% 22%, rgba(255, 159, 67, 0.20), transparent 24%),
+        radial-gradient(circle at 50% 90%, rgba(79, 141, 247, 0.18), transparent 22%);
       opacity: 0.95;
       pointer-events: none;
     }
@@ -233,8 +233,8 @@
       gap: 14px;
       padding: 16px;
       border-radius: var(--radius-md);
-      background: rgba(255,255,255,0.04);
-      border: 1px solid rgba(255,255,255,0.07);
+      background: rgba(255,255,255,0.66);
+      border: 1px solid rgba(37,99,235,0.12);
     }
 
     .step-num {
@@ -257,7 +257,7 @@
       font-size: 0.86rem;
       line-height: 1.6;
       padding-top: 8px;
-      border-top: 1px solid rgba(255,255,255,0.08);
+      border-top: 1px solid rgba(37,99,235,0.12);
     }
 
     .workspace {
@@ -307,7 +307,7 @@
       border-radius: 24px;
       padding: 28px;
       border: 1px dashed rgba(57,96,139,0.28);
-      background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(236,248,255,0.68));
+      background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(232,250,255,0.78));
       min-height: 260px;
       display: flex;
       flex-direction: column;
@@ -355,12 +355,15 @@
       font-weight: 700;
       letter-spacing: 0.01em;
       cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       transition: transform 140ms ease, box-shadow 140ms ease, opacity 140ms ease;
     }
 
     .button {
       color: #ffffff;
-      background: linear-gradient(145deg, var(--accent), #97f0dc);
+      background: linear-gradient(145deg, var(--accent), #56dff2);
       box-shadow: 0 16px 30px rgba(0, 184, 169, 0.22);
     }
 
@@ -370,8 +373,24 @@
       border: 1px solid rgba(57,96,139,0.18);
     }
 
+    .button-secondary.back-button {
+      color: #11446f;
+      background: linear-gradient(145deg, rgba(255,255,255,0.96), rgba(232,250,255,0.96));
+      border-color: rgba(79,141,247,0.26);
+      box-shadow: 0 10px 22px rgba(79, 141, 247, 0.12);
+    }
+
     .button:hover, .button-secondary:hover { transform: translateY(-1px); }
     .button:disabled { cursor: not-allowed; opacity: 0.45; transform: none; box-shadow: none; }
+
+    .file-input {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      overflow: hidden;
+      pointer-events: none;
+    }
 
     .side-stack { display: grid; gap: 14px; align-content: start; }
 
@@ -484,6 +503,14 @@
       white-space: nowrap;
       color: var(--text);
       font-size: 0.9rem;
+    }
+
+    .analysis-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+      align-items: center;
     }
 
     .cards {
@@ -644,7 +671,17 @@
   <main class="shell">
     <div class="topbar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true"></div>
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 120 120" role="img">
+            <path d="M21 75C25 37 58 17 91 27C79 18 60 14 42 22C27 29 18 42 13 59C26 45 38 39 52 39C36 47 25 59 21 75Z" fill="#082b7d"/>
+            <path d="M98 45C111 73 96 104 67 111C47 116 27 109 14 94C29 101 45 102 61 97C82 90 96 70 98 45Z" fill="#082b7d"/>
+            <rect x="39" y="73" width="14" height="24" rx="2" fill="#1267d8"/>
+            <rect x="60" y="61" width="14" height="36" rx="2" fill="#1267d8"/>
+            <rect x="81" y="47" width="14" height="50" rx="2" fill="#1267d8"/>
+            <path d="M33 68L57 47L72 53L101 22" fill="none" stroke="#21c55d" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M87 21L105 18L102 36Z" fill="#21c55d"/>
+          </svg>
+        </div>
         <div>
           <h1>CreditSight</h1>
           <p>Upload. Pick a model. Read the risk story.</p>
@@ -726,11 +763,11 @@
                 <h3>Drag and drop your file here</h3>
                 <p>or choose an Excel sheet from your device. Decision Tree, Random Forest, and XGBoost use this file for predictions.</p>
                 <div class="btn-row">
-                  <button class="button" id="browseBtn" type="button">Browse file</button>
+                  <label class="button" id="browseBtn" for="fileInput" role="button" tabindex="0">Browse file</label>
                   <button class="button-secondary" id="continueBtn" type="button" disabled>Continue</button>
                 </div>
 
-                <input id="fileInput" type="file" accept=".csv,.xls,.xlsx" hidden />
+                <input id="fileInput" class="file-input" type="file" accept=".csv,.xls,.xlsx" />
               </div>
             </div>
 
@@ -777,7 +814,7 @@
 
               <div class="panel" style="padding: 18px; margin-top: 18px;">
                 <div class="btn-row" style="justify-content: flex-start; margin-bottom: 14px;">
-                  <button class="button-secondary" id="backToUploadBtn" type="button">Back</button>
+                  <button class="button-secondary back-button" id="backToUploadBtn" type="button">Back</button>
                 </div>
                 <h4 style="margin: 0 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.88rem;">Model selector</h4>
                 <div class="select-wrap">
@@ -872,7 +909,10 @@
                   and the SHAP explanation sits on the right, with the selected model displayed prominently.
                 </p>
               </div>
-              <div class="model-tag" id="selectedModelTag">Model: Decision Tree</div>
+              <div class="analysis-actions">
+                <button class="button-secondary back-button" id="backToModelBtn" type="button">Back</button>
+                <div class="model-tag" id="selectedModelTag">Model: Decision Tree</div>
+              </div>
             </div>
 
             <div class="cards">
