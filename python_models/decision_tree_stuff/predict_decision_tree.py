@@ -19,7 +19,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.tree import DecisionTreeClassifier
 
-RANDOM_STATE = 42
+RANDOM_STATE = 143
 
 
 def group_rating(rating):
