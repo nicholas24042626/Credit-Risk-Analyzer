@@ -31,6 +31,7 @@ function initApp() {
   const fileInput = document.getElementById("fileInput");
   const browseBtn = document.getElementById("browseBtn");
   const continueBtn = document.getElementById("continueBtn");
+  const backToUploadBtn = document.getElementById("backToUploadBtn");
   const dropzone = document.getElementById("dropzone");
   const selectedFileName = document.getElementById("selectedFileName");
   const selectedFileMeta = document.getElementById("selectedFileMeta");
@@ -485,6 +486,10 @@ function initApp() {
   continueBtn.addEventListener("click", () => {
     if (!appState.uploaded) return;
     showScreen(modelScreen);
+  });
+
+  backToUploadBtn.addEventListener("click", () => {
+    showScreen(uploadScreen);
   });
 
   analyzeBtn.addEventListener("click", () => {
