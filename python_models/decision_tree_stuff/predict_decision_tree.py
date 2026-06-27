@@ -30,17 +30,16 @@ def group_rating(rating):
 
     Investment_High : AAA, AA, A
     Investment_Low  : BBB
-    Speculative     : BB, B, CCC, CC
-    Distressed      : C, D
+    Speculative     : BB, B
+    Distressed      : CCC, CC, C, D
     """
-    rating = str(rating).strip().upper()
     if rating in ["AAA", "AA", "A"]:
         return "Investment-High"
     elif rating == "BBB":
         return "Investment-Low"
-    elif rating in ["BB", "B", "CCC", "CC"]:
+    elif rating in ["BB", "B"]:
         return "Speculative"
-    elif rating in ["C", "D"]:
+    elif rating in ["CCC", "CC", "C", "D"]:
         return "Distressed"
     else:
         return "Unknown"
