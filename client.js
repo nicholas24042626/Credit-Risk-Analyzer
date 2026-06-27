@@ -460,10 +460,10 @@ function initApp() {
         modelData["XGBoost"] = result.modelData;
       }
 
-      predictionResult.textContent = `Dataset evaluated successfully.`;
+      predictionResult.textContent = `Prediction: ${formatPredictionLabel(result.prediction || "Unknown")}`;
       predictionResult.className = "prediction-result success";
       appState.model = "XGBoost";
-      selectedModelTag.textContent = `Model: XGBoost · Dataset Evaluated`;
+      selectedModelTag.textContent = `Model: XGBoost · Prediction: ${formatPredictionLabel(result.prediction || "Unknown")}`;
       renderMetrics("XGBoost");
       renderMatrix("XGBoost");
       renderShap("XGBoost");

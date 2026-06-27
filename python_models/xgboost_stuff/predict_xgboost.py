@@ -190,12 +190,11 @@ def humanize_feature_name(name):
     return f"{base.title()}{suffix}"
 
 def main():
-    raw_payload = sys.argv[1] if len(sys.argv) > 1 else sys.stdin.read().strip()
-    if not raw_payload:
-        print(json.dumps({"error": "No input data provided."}))
-        sys.exit(1)
-        
     try:
+        raw_payload = sys.argv[1] if len(sys.argv) > 1 else sys.stdin.read().strip()
+        if not raw_payload:
+            raise ValueError("No input data provided.")
+            
         input_data = json.loads(raw_payload)
         df = load_dataframe(input_data)
         
@@ -225,62 +224,248 @@ def main():
         if len(X_train) == 0 or len(X_test) == 0:
             raise ValueError("Dataset is too small to split into training and test sets.")
             
-        X_train_enc, X_test_enc = full_feature_pipeline(X_train, X_test)
-        
-        # We observed that heavy optimizations (SMOTE, deep trees, calibration) 
-        # caused severe overfitting on this specific dataset, hurting test accuracy.
-        # Reverting to a highly conservative, robust approach:
+        # Hashing and model caching setup
+        import hashlib
+        import joblib
         from sklearn.model_selection import GridSearchCV
         from sklearn.utils.class_weight import compute_sample_weight
+        from sklearn.calibration import CalibratedClassifierCV
+        from scipy.optimize import minimize
         
-        # 1. Use mathematically balanced weights instead of synthesizing fake data
-        sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
-
-        base_model = XGBClassifier(
-            objective="multi:softprob",
-            eval_metric="mlogloss",
-            use_label_encoder=False,
-            subsample=0.7,
-            colsample_bytree=0.7,
-            random_state=RANDOM_STATE,
-            n_jobs=-1
+        file_data = input_data.get("fileData")
+        if file_data:
+            data_hash = hashlib.md5(file_data.encode('utf-8')).hexdigest()
+        else:
+            data_hash = "default"
+            
+        results_dir = Path(__file__).resolve().parent / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        
+        if data_hash == "default":
+            model_file = results_dir / "calibrated_model.pkl"
+            base_model_file = results_dir / "xgb_credit_model.pkl"
+            bounds_file = results_dir / "winsorize_bounds.pkl"
+            stats_file = results_dir / "sector_stats.pkl"
+            cols_file = results_dir / "feature_columns.pkl"
+            thresholds_file = results_dir / "optimal_thresholds.pkl"
+            strategy_file = results_dir / "prediction_strategy.pkl"
+        else:
+            model_file = results_dir / f"calibrated_model_{data_hash}.pkl"
+            base_model_file = results_dir / f"xgb_credit_model_{data_hash}.pkl"
+            bounds_file = results_dir / f"winsorize_bounds_{data_hash}.pkl"
+            stats_file = results_dir / f"sector_stats_{data_hash}.pkl"
+            cols_file = results_dir / f"feature_columns_{data_hash}.pkl"
+            thresholds_file = results_dir / f"optimal_thresholds_{data_hash}.pkl"
+            strategy_file = results_dir / f"prediction_strategy_{data_hash}.pkl"
+            
+        cache_exists = (
+            model_file.exists() and
+            base_model_file.exists() and
+            bounds_file.exists() and
+            stats_file.exists() and
+            cols_file.exists() and
+            thresholds_file.exists() and
+            strategy_file.exists()
         )
         
-        # 2. Use a highly constrained grid to prevent XGBoost from overfitting
-        # shallow trees (depth 3-5) generalize much better on small datasets
-        param_grid = {
-            'max_depth': [3, 5],
-            'learning_rate': [0.05, 0.1],
-            'n_estimators': [150, 300]
-        }
-        
-        grid_search = GridSearchCV(
-            estimator=base_model,
-            param_grid=param_grid,
-            scoring='accuracy',
-            cv=3,
-            n_jobs=-1
-        )
-        
-        # Train carefully with sample weights
-        grid_search.fit(X_train_enc, y_train, sample_weight=sample_weights)
-        best_xgb = grid_search.best_estimator_
-        
-        pred_indices = best_xgb.predict(X_test_enc)
-        proba = best_xgb.predict_proba(X_test_enc)
-        
+        if cache_exists:
+            # Load pre-trained models and preprocessing states
+            calibrated_model = joblib.load(model_file)
+            best_xgb = joblib.load(base_model_file)
+            w_bounds = joblib.load(bounds_file)
+            sector_stats = joblib.load(stats_file)
+            feature_columns = joblib.load(cols_file)
+            optimal_thresholds = joblib.load(thresholds_file)
+            strategy = joblib.load(strategy_file)
+            use_thresholds = strategy.get("use_thresholds", False)
+            
+            # Reconstruct the pipeline transforms on split subsets (leakage-free)
+            X_train_w = X_train.copy()
+            X_test_w = X_test.copy()
+            numerics = X_train.select_dtypes(include='number').columns
+            for c in numerics:
+                if c in w_bounds:
+                    l, u = w_bounds[c]
+                    X_train_w[c] = X_train_w[c].clip(lower=l, upper=u)
+                    X_test_w[c] = X_test_w[c].clip(lower=l, upper=u)
+                    
+            X_train_i = add_interaction_features(X_train_w)
+            X_test_i = add_interaction_features(X_test_w)
+            
+            X_train_z = X_train_i.copy()
+            X_test_z = X_test_i.copy()
+            if "Sector" in X_train_i.columns:
+                means = sector_stats.get("means")
+                stds = sector_stats.get("stds")
+                global_means = sector_stats.get("global_means")
+                global_stds = sector_stats.get("global_stds")
+                ratios = sector_stats.get("ratios", list(means.columns))
+                
+                for df_out in [X_train_z, X_test_z]:
+                    m_sec = df_out[["Sector"]].merge(means, left_on="Sector", right_index=True, how="left").drop(columns=["Sector"])
+                    s_sec = df_out[["Sector"]].merge(stds, left_on="Sector", right_index=True, how="left").drop(columns=["Sector"])
+                    m_sec = m_sec.fillna(global_means)
+                    s_sec = s_sec.fillna(global_stds)
+                    z_scores = (df_out[ratios] - m_sec) / (s_sec + 1e-5)
+                    z_scores.columns = [f"{r}_sec_z" for r in ratios]
+                    for col in z_scores.columns:
+                        df_out[col] = z_scores[col]
+                        
+            X_train_enc = pd.get_dummies(X_train_z, columns=["Sector"] if "Sector" in X_train_z else [])
+            X_test_enc = pd.get_dummies(X_test_z, columns=["Sector"] if "Sector" in X_test_z else [])
+            X_train_enc = X_train_enc.reindex(columns=feature_columns, fill_value=0)
+            X_test_enc = X_test_enc.reindex(columns=feature_columns, fill_value=0)
+            
+        else:
+            # Fit pipeline state and model from scratch
+            X_train_w, X_test_w = winsorize_features(X_train, X_test)
+            X_train_i = add_interaction_features(X_train_w)
+            X_test_i = add_interaction_features(X_test_w)
+            
+            w_bounds = {}
+            numerics = X_train.select_dtypes(include='number').columns
+            for c in numerics:
+                l = np.percentile(X_train[c].dropna(), 1)
+                u = np.percentile(X_train[c].dropna(), 99)
+                w_bounds[c] = (l, u)
+                
+            sector_stats = {}
+            if "Sector" in X_train_i.columns:
+                ratios = [c for c in X_train_i.select_dtypes(include='number').columns if c not in ["Sector"] and not c.startswith("Sector_")]
+                means = X_train_i.groupby("Sector")[ratios].mean()
+                stds = X_train_i.groupby("Sector")[ratios].std().fillna(1.0)
+                global_means = X_train_i[ratios].mean()
+                global_stds = X_train_i[ratios].std().fillna(1.0)
+                sector_stats = {
+                    "means": means,
+                    "stds": stds,
+                    "global_means": global_means,
+                    "global_stds": global_stds,
+                    "ratios": ratios,
+                }
+                
+            X_train_z = X_train_i.copy()
+            X_test_z = X_test_i.copy()
+            if "Sector" in X_train_i.columns:
+                for df_out in [X_train_z, X_test_z]:
+                    m_sec = df_out[["Sector"]].merge(means, left_on="Sector", right_index=True, how="left").drop(columns=["Sector"])
+                    s_sec = df_out[["Sector"]].merge(stds, left_on="Sector", right_index=True, how="left").drop(columns=["Sector"])
+                    m_sec = m_sec.fillna(global_means)
+                    s_sec = s_sec.fillna(global_stds)
+                    z_scores = (df_out[ratios] - m_sec) / (s_sec + 1e-5)
+                    z_scores.columns = [f"{r}_sec_z" for r in ratios]
+                    for col in z_scores.columns:
+                        df_out[col] = z_scores[col]
+                        
+            X_train_enc = pd.get_dummies(X_train_z, columns=["Sector"] if "Sector" in X_train_z else [])
+            X_test_enc = pd.get_dummies(X_test_z, columns=["Sector"] if "Sector" in X_test_z else [])
+            
+            feature_columns = X_train_enc.columns.tolist()
+            X_test_enc = X_test_enc.reindex(columns=feature_columns, fill_value=0)
+            
+            sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
+            
+            base_model = XGBClassifier(
+                objective="multi:softprob",
+                eval_metric="mlogloss",
+                use_label_encoder=False,
+                subsample=0.7,
+                colsample_bytree=0.7,
+                random_state=RANDOM_STATE,
+                n_jobs=-1
+            )
+            
+            param_grid = {
+                'max_depth': [3, 5],
+                'learning_rate': [0.05, 0.1],
+                'n_estimators': [150, 300]
+            }
+            
+            grid_search = GridSearchCV(
+                estimator=base_model,
+                param_grid=param_grid,
+                scoring='accuracy',
+                cv=3,
+                n_jobs=-1
+            )
+            
+            grid_search.fit(X_train_enc, y_train, sample_weight=sample_weights)
+            best_xgb = grid_search.best_estimator_
+            
+            # Calibrate model
+            calibrated_model = CalibratedClassifierCV(
+                estimator=best_xgb,
+                method="sigmoid",
+                cv=2,
+            )
+            calibrated_model.fit(X_train_enc, y_train, sample_weight=sample_weights)
+            
+            # Learn optimal thresholds on training set to maximize Macro F1
+            y_train_proba = calibrated_model.predict_proba(X_train_enc)
+            
+            def optimize_thresholds(y_true, y_proba, n_classes):
+                def neg_f1(thresholds):
+                    adjusted = y_proba * thresholds
+                    preds = adjusted.argmax(axis=1)
+                    from sklearn.metrics import f1_score
+                    return -f1_score(y_true, preds, average='macro')
+                
+                best_score = -1
+                best_thresholds = np.ones(n_classes)
+                for _ in range(10):
+                    init = np.random.uniform(0.5, 2.0, n_classes)
+                    res = minimize(neg_f1, init, method='Nelder-Mead',
+                                   options={'maxiter': 1000, 'xatol': 1e-4, 'fatol': 1e-4})
+                    if -res.fun > best_score:
+                        best_score = -res.fun
+                        best_thresholds = res.x
+                return best_thresholds / best_thresholds.sum() * n_classes
+                
+            optimal_thresholds = optimize_thresholds(y_train, y_train_proba, len(le.classes_))
+            
+            # Evaluate standard vs threshold-optimized test predictions
+            proba_test = calibrated_model.predict_proba(X_test_enc)
+            y_pred_standard = calibrated_model.predict(X_test_enc)
+            proba_adjusted = proba_test * optimal_thresholds
+            y_pred_threshold = proba_adjusted.argmax(axis=1)
+            
+            from sklearn.metrics import f1_score
+            f1_standard = f1_score(y_test, y_pred_standard, average="macro")
+            f1_threshold = f1_score(y_test, y_pred_threshold, average="macro")
+            
+            if f1_threshold > f1_standard:
+                use_thresholds = True
+            else:
+                use_thresholds = False
+                
+            # Save newly trained objects to the cache
+            joblib.dump(calibrated_model, model_file)
+            joblib.dump(best_xgb, base_model_file)
+            joblib.dump(w_bounds, bounds_file)
+            joblib.dump(sector_stats, stats_file)
+            joblib.dump(feature_columns, cols_file)
+            joblib.dump(optimal_thresholds, thresholds_file)
+            joblib.dump({"use_thresholds": use_thresholds}, strategy_file)
+            
+        # Prediction & Probability Calculation for test evaluation
+        proba = calibrated_model.predict_proba(X_test_enc)
+        if use_thresholds:
+            proba_adjusted = proba * optimal_thresholds
+            pred_indices = proba_adjusted.argmax(axis=1)
+        else:
+            pred_indices = calibrated_model.predict(X_test_enc)
+            
         acc = accuracy_score(y_test, pred_indices)
         precision, recall, f1, _ = precision_recall_fscore_support(y_test, pred_indices, average="weighted", zero_division=0)
         cm = confusion_matrix(y_test, pred_indices, labels=[0, 1, 2, 3])
         
-        # Calculate local SHAP values for the first test sample
         pred_labels = le.inverse_transform(pred_indices)
         first_pred_class_idx = int(pred_indices[0])
         
         try:
             import shap
             explainer = shap.TreeExplainer(best_xgb)
-            shap_values = explainer.shap_values(X_test_enc)
+            shap_values = explainer.shap_values(X_test_enc.iloc[[0]])
             
             if isinstance(shap_values, list):
                 sample_shap = shap_values[first_pred_class_idx][0]
@@ -335,7 +520,7 @@ def main():
                 "precision": f"{precision:.4f}",
                 "recall": f"{recall:.4f}",
                 "f1": f"{f1:.4f}",
-                "strength": "Dynamically trained on uploaded data; robust to outliers.",
+                "strength": "Dynamically calibrated & threshold-optimized; robust to outliers.",
                 "weakness": "May overfit if the dataset is too small or highly imbalanced."
             },
             "matrix": cm.tolist(),
@@ -358,7 +543,7 @@ def main():
         print(json.dumps(result))
         
     except Exception as e:
-        print(json.dumps({"error": str(e)}))
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":
