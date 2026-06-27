@@ -32,6 +32,7 @@ function initApp() {
   const browseBtn = document.getElementById("browseBtn");
   const continueBtn = document.getElementById("continueBtn");
   const backToUploadBtn = document.getElementById("backToUploadBtn");
+  const backToModelBtn = document.getElementById("backToModelBtn");
   const dropzone = document.getElementById("dropzone");
   const selectedFileName = document.getElementById("selectedFileName");
   const selectedFileMeta = document.getElementById("selectedFileMeta");
@@ -475,7 +476,16 @@ function initApp() {
     }
   }
 
-  browseBtn.addEventListener("click", () => fileInput.click());
+  browseBtn.addEventListener("click", (event) => {
+    event.stopPropagation();
+  });
+
+  browseBtn.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      fileInput.click();
+    }
+  });
 
   fileInput.addEventListener("change", (event) => {
     const file = event.target.files && event.target.files[0];
@@ -490,6 +500,10 @@ function initApp() {
 
   backToUploadBtn.addEventListener("click", () => {
     showScreen(uploadScreen);
+  });
+
+  backToModelBtn.addEventListener("click", () => {
+    showScreen(modelScreen);
   });
 
   analyzeBtn.addEventListener("click", () => {
@@ -529,7 +543,7 @@ function initApp() {
   });
 
   dropzone.addEventListener("click", (event) => {
-    if (event.target.closest("button")) return;
+    if (event.target.closest("button, label")) return;
     fileInput.click();
   });
 
