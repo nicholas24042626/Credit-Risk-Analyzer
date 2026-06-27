@@ -47,14 +47,10 @@ def humanize_feature_name(name):
 
 def load_default_dataframe():
     project_root = Path(__file__).resolve().parents[1]
-    candidates = [
-        project_root / "set A corporate_rating.csv",
-        project_root / "data" / "set A corporate_rating.csv",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return pd.read_csv(candidate)
-    raise FileNotFoundError("Default dataset was not found in the project folder.")
+    default_path = project_root / "set A corporate_rating.csv"
+    if default_path.exists():
+        return pd.read_csv(default_path)
+    raise FileNotFoundError("Default dataset was not found at the notebook's CSV path.")
 
 
 def load_uploaded_dataframe(payload):
@@ -72,8 +68,10 @@ def load_uploaded_dataframe(payload):
             tmp.write(binary)
             temp_path = tmp.name
         try:
-            if suffix in [".xlsx", ".xls"]:
-                return pd.read_excel(temp_path)
+            if suffix == ".xlsx":
+                return pd.read_excel(temp_path, engine="openpyxl")
+            if suffix == ".xls":
+                return pd.read_excel(temp_path, engine="xlrd")
             return pd.read_csv(temp_path)
         finally:
             try:
@@ -158,6 +156,10 @@ def main():
 
     baseline_model = build_pipeline(X)
     baseline_model.fit(X_train, y_train)
+    baseline_pred = baseline_model.predict(X_test)
+    baseline_accuracy = float(accuracy_score(y_test, baseline_pred))
+    baseline_f1 = float(f1_score(y_test, baseline_pred, average="weighted"))
+    baseline_report = classification_report(y_test, baseline_pred, output_dict=True)
 
     param_grid = {
         "model__criterion": ["gini", "entropy"],
@@ -296,6 +298,22 @@ def main():
 
     result = {
         "prediction": predicted_class,
+        "samplePrediction": {
+            "class": predicted_class,
+            "prediction": predicted_class,
+            "sampleIndex": int(X_test.index[0]),
+        },
+        "classLabels": labels,
+        "baseline": {
+            "accuracy": round(baseline_accuracy, 4),
+            "f1": round(baseline_f1, 4),
+            "classificationReport": baseline_report
+        },
+        "tuned": {
+            "accuracy": round(accuracy, 4),
+            "f1": round(f1, 4),
+            "classificationReport": report
+        },
         "metrics": {
             "accuracy": round(accuracy, 4),
             "precision": round(precision, 4),
@@ -308,6 +326,14 @@ def main():
             "labels": labels,
             "values": cm.tolist()
         },
+        "featureImportance": [
+            {
+                "feature": item["feature"],
+                "importance": round(item["value"], 4),
+                "effect": item["effect"]
+            }
+            for item in shap_features
+        ],
         "shap": {
             "selectedClass": predicted_class,
             "prediction": predicted_class,
@@ -325,7 +351,19 @@ def main():
                 "strength": strength,
                 "weakness": weakness
             },
+            "baseline": {
+                "accuracy": f"{baseline_accuracy:.4f}",
+                "f1": f"{baseline_f1:.4f}"
+            },
             "matrix": cm.tolist(),
+            "featureImportance": [
+                {
+                    "feature": item["feature"],
+                    "importance": round(item["value"], 4),
+                    "effect": item["effect"]
+                }
+                for item in shap_features
+            ],
             "shap": [
                 [item["feature"], round(item["value"], 4)]
                 for item in shap_features

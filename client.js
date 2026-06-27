@@ -364,10 +364,10 @@ function initApp() {
         modelData["Decision Tree"] = result.modelData;
       }
 
-      predictionResult.textContent = `Model trained and dataset evaluated successfully.`;
+      predictionResult.textContent = `Prediction: ${formatPredictionLabel(result.samplePrediction?.prediction || result.prediction || "Unknown")}`;
       predictionResult.className = "prediction-result success";
       appState.model = "Decision Tree";
-      selectedModelTag.textContent = `Model: Decision Tree · Dataset Evaluated`;
+      selectedModelTag.textContent = `Model: Decision Tree · Prediction: ${formatPredictionLabel(result.samplePrediction?.prediction || result.prediction || "Unknown")}`;
       renderMetrics("Decision Tree");
       renderMatrix("Decision Tree");
       renderShap("Decision Tree");
