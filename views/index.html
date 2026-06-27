@@ -3,20 +3,20 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Credit Risk Analyzer</title>
+  <title>CreditSight</title>
   <style>
     :root {
-      --bg: #07111f;
-      --panel: rgba(13, 24, 43, 0.84);
-      --panel-strong: rgba(17, 31, 55, 0.94);
-      --line: rgba(255, 255, 255, 0.08);
-      --text: #e9f2ff;
-      --muted: #9fb4d0;
-      --accent: #54e0c1;
-      --accent-2: #ff9b5a;
-      --accent-3: #7ea7ff;
-      --danger: #ff6c8f;
-      --shadow: 0 30px 90px rgba(0, 0, 0, 0.35);
+      --bg: #f7fbff;
+      --panel: rgba(255, 255, 255, 0.9);
+      --panel-strong: rgba(255, 255, 255, 0.96);
+      --line: rgba(57, 96, 139, 0.16);
+      --text: #14324d;
+      --muted: #5d748b;
+      --accent: #00b8a9;
+      --accent-2: #ff8a4c;
+      --accent-3: #3b82f6;
+      --danger: #e5486d;
+      --shadow: 0 26px 70px rgba(55, 94, 128, 0.18);
       --radius-xl: 28px;
       --radius-lg: 20px;
       --radius-md: 16px;
@@ -30,10 +30,10 @@
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(circle at top left, rgba(84, 224, 193, 0.15), transparent 28%),
-        radial-gradient(circle at 80% 10%, rgba(126, 167, 255, 0.18), transparent 24%),
-        radial-gradient(circle at 90% 80%, rgba(255, 155, 90, 0.12), transparent 22%),
-        linear-gradient(135deg, #050b14 0%, #091424 45%, #07111f 100%);
+        radial-gradient(circle at top left, rgba(0, 184, 169, 0.18), transparent 28%),
+        radial-gradient(circle at 80% 10%, rgba(59, 130, 246, 0.16), transparent 24%),
+        radial-gradient(circle at 90% 80%, rgba(255, 138, 76, 0.16), transparent 22%),
+        linear-gradient(135deg, #f8fdff 0%, #eef8ff 46%, #fff9f3 100%);
       overflow-x: hidden;
     }
 
@@ -43,11 +43,11 @@
       inset: 0;
       pointer-events: none;
       background-image:
-        linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+        linear-gradient(rgba(20,50,77,0.05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(20,50,77,0.05) 1px, transparent 1px);
       background-size: 64px 64px;
       mask-image: radial-gradient(circle at center, black 30%, transparent 88%);
-      opacity: 0.4;
+      opacity: 0.55;
     }
 
     .shell {
@@ -57,7 +57,7 @@
       padding: 18px;
       border: 1px solid var(--line);
       border-radius: 36px;
-      background: rgba(4, 10, 20, 0.55);
+      background: rgba(255, 255, 255, 0.72);
       box-shadow: var(--shadow);
       backdrop-filter: blur(18px);
     }
@@ -82,8 +82,8 @@
       width: 52px;
       height: 52px;
       border-radius: 18px;
-      background: linear-gradient(145deg, rgba(84, 224, 193, 0.95), rgba(126, 167, 255, 0.9));
-      box-shadow: 0 16px 30px rgba(84, 224, 193, 0.24);
+      background: linear-gradient(145deg, rgba(0, 184, 169, 0.95), rgba(59, 130, 246, 0.9));
+      box-shadow: 0 16px 30px rgba(0, 184, 169, 0.22);
       position: relative;
       overflow: hidden;
     }
@@ -117,7 +117,7 @@
       padding: 10px 14px;
       border-radius: 999px;
       border: 1px solid var(--line);
-      background: rgba(255,255,255,0.04);
+      background: rgba(255,255,255,0.68);
       color: var(--muted);
       font-size: 0.88rem;
       white-space: nowrap;
@@ -134,7 +134,7 @@
     .workspace {
       border: 1px solid var(--line);
       border-radius: var(--radius-xl);
-      background: linear-gradient(180deg, rgba(16, 29, 51, 0.84), rgba(12, 22, 39, 0.92));
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(242, 249, 255, 0.94));
       overflow: hidden;
     }
 
@@ -149,9 +149,9 @@
       position: absolute;
       inset: 0;
       background:
-        radial-gradient(circle at 20% 20%, rgba(84, 224, 193, 0.16), transparent 22%),
-        radial-gradient(circle at 80% 22%, rgba(255, 155, 90, 0.12), transparent 24%),
-        radial-gradient(circle at 50% 90%, rgba(126, 167, 255, 0.12), transparent 22%);
+        radial-gradient(circle at 20% 20%, rgba(0, 184, 169, 0.18), transparent 22%),
+        radial-gradient(circle at 80% 22%, rgba(255, 138, 76, 0.14), transparent 24%),
+        radial-gradient(circle at 50% 90%, rgba(59, 130, 246, 0.14), transparent 22%);
       opacity: 0.95;
       pointer-events: none;
     }
@@ -173,8 +173,8 @@
       width: fit-content;
       padding: 9px 14px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.72);
+      border: 1px solid rgba(57,96,139,0.14);
       color: var(--muted);
       font-size: 0.86rem;
       letter-spacing: 0.06em;
@@ -208,8 +208,8 @@
     .stat {
       padding: 14px;
       border-radius: var(--radius-md);
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.07);
+      background: rgba(255,255,255,0.72);
+      border: 1px solid rgba(57,96,139,0.14);
     }
 
     .stat strong {
@@ -243,8 +243,8 @@
       border-radius: 11px;
       display: grid;
       place-items: center;
-      background: linear-gradient(145deg, rgba(84, 224, 193, 0.95), rgba(126, 167, 255, 0.95));
-      color: #06111e;
+      background: linear-gradient(145deg, rgba(0, 184, 169, 0.95), rgba(59, 130, 246, 0.95));
+      color: #ffffff;
       font-weight: 800;
       flex: 0 0 auto;
     }
@@ -278,7 +278,7 @@
       border-radius: var(--radius-lg);
       background: var(--panel);
       border: 1px solid var(--line);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.7);
     }
 
     .upload-panel {
@@ -306,8 +306,8 @@
       margin-top: 18px;
       border-radius: 24px;
       padding: 28px;
-      border: 1px dashed rgba(255,255,255,0.18);
-      background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02));
+      border: 1px dashed rgba(57,96,139,0.28);
+      background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(236,248,255,0.68));
       min-height: 260px;
       display: flex;
       flex-direction: column;
@@ -318,8 +318,8 @@
     }
 
     .dropzone.dragover {
-      border-color: rgba(84, 224, 193, 0.75);
-      background: rgba(84, 224, 193, 0.08);
+      border-color: rgba(0, 184, 169, 0.8);
+      background: rgba(0, 184, 169, 0.1);
       transform: translateY(-2px);
     }
 
@@ -330,9 +330,9 @@
       display: grid;
       place-items: center;
       font-size: 2rem;
-      background: linear-gradient(145deg, rgba(84, 224, 193, 0.95), rgba(126, 167, 255, 0.95));
-      color: #07111f;
-      box-shadow: 0 20px 40px rgba(84, 224, 193, 0.18);
+      background: linear-gradient(145deg, rgba(0, 184, 169, 0.95), rgba(59, 130, 246, 0.95));
+      color: #ffffff;
+      box-shadow: 0 20px 40px rgba(0, 184, 169, 0.18);
       margin-bottom: 16px;
     }
 
@@ -359,15 +359,15 @@
     }
 
     .button {
-      color: #06111e;
+      color: #ffffff;
       background: linear-gradient(145deg, var(--accent), #97f0dc);
-      box-shadow: 0 16px 30px rgba(84, 224, 193, 0.22);
+      box-shadow: 0 16px 30px rgba(0, 184, 169, 0.22);
     }
 
     .button-secondary {
       color: var(--text);
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.74);
+      border: 1px solid rgba(57,96,139,0.18);
     }
 
     .button:hover, .button-secondary:hover { transform: translateY(-1px); }
@@ -413,15 +413,15 @@
     select {
       width: 100%;
       border-radius: 14px;
-      border: 1px solid rgba(255,255,255,0.1);
-      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(57,96,139,0.18);
+      background: rgba(255,255,255,0.86);
       color: var(--text);
       padding: 13px 14px;
       font-size: 0.98rem;
       outline: none;
     }
 
-    select option { background: #0d1726; color: var(--text); }
+    select option { background: #ffffff; color: var(--text); }
 
     .ratio-form {
       display: grid;
@@ -435,8 +435,8 @@
     .ratio-field input {
       width: 100%;
       border-radius: 10px;
-      border: 1px solid rgba(255,255,255,0.1);
-      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(57,96,139,0.18);
+      background: rgba(255,255,255,0.86);
       color: var(--text);
       padding: 9px 10px;
       font: inherit;
@@ -456,9 +456,9 @@
     .chip {
       padding: 8px 12px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.05);
+      background: rgba(255,255,255,0.74);
       color: var(--muted);
-      border: 1px solid rgba(255,255,255,0.07);
+      border: 1px solid rgba(57,96,139,0.14);
       font-size: 0.86rem;
     }
 
@@ -479,8 +479,8 @@
     .model-tag {
       padding: 10px 14px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.06);
-      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.78);
+      border: 1px solid rgba(57,96,139,0.14);
       white-space: nowrap;
       color: var(--text);
       font-size: 0.9rem;
@@ -496,7 +496,7 @@
       grid-column: span 6;
       padding: 18px;
       border-radius: 24px;
-      background: rgba(7, 14, 24, 0.72);
+      background: rgba(255, 255, 255, 0.82);
       border: 1px solid var(--line);
     }
 
@@ -519,8 +519,8 @@
       justify-content: center;
       align-items: center;
       text-align: center;
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.78);
+      border: 1px solid rgba(57,96,139,0.14);
     }
 
     .matrix .cell span {
@@ -533,8 +533,8 @@
     .matrix .cell strong { font-size: 1.16rem; letter-spacing: -0.03em; }
 
     .matrix .diag {
-      background: linear-gradient(180deg, rgba(84,224,193,0.20), rgba(84,224,193,0.08));
-      border-color: rgba(84,224,193,0.22);
+      background: linear-gradient(180deg, rgba(0,184,169,0.20), rgba(0,184,169,0.08));
+      border-color: rgba(0,184,169,0.24);
     }
 
     .legend {
@@ -579,9 +579,9 @@
       width: 100%;
       height: 14px;
       border-radius: 999px;
-      background: rgba(255,255,255,0.06);
+      background: rgba(57,96,139,0.1);
       overflow: hidden;
-      border: 1px solid rgba(255,255,255,0.06);
+      border: 1px solid rgba(57,96,139,0.1);
     }
 
     .bar-fill {
@@ -601,8 +601,8 @@
     .mini-card {
       border-radius: 22px;
       padding: 16px;
-      border: 1px solid rgba(255,255,255,0.07);
-      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(57,96,139,0.14);
+      background: rgba(255,255,255,0.74);
     }
 
     .mini-card h5 { margin: 0 0 8px; font-size: 0.98rem; }
@@ -646,7 +646,7 @@
       <div class="brand">
         <div class="brand-mark" aria-hidden="true"></div>
         <div>
-          <h1>Credit Risk Analyzer</h1>
+          <h1>CreditSight</h1>
           <p>Upload. Pick a model. Read the risk story.</p>
         </div>
       </div>
@@ -657,7 +657,7 @@
       <aside class="hero">
         <div class="hero-content">
           <div>
-            <div class="eyebrow">Corporate Credit Risk Web Experience</div>
+            <div class="eyebrow">CreditSight Web Experience</div>
             <h2>From spreadsheet to <span>model insights</span> in one clean flow.</h2>
             <p class="hero-copy">
               This is a polished website design for companies uploading credit-risk datasets.
@@ -706,7 +706,7 @@
           </div>
 
           <div class="footer-note">
-            Design prototype only. The interactions are front-end and meant to show the final product layout.
+            CreditSight keeps upload, model choice, and risk explanation in one guided workspace.
           </div>
         </div>
       </aside>
@@ -776,6 +776,9 @@
               </p>
 
               <div class="panel" style="padding: 18px; margin-top: 18px;">
+                <div class="btn-row" style="justify-content: flex-start; margin-bottom: 14px;">
+                  <button class="button-secondary" id="backToUploadBtn" type="button">Back</button>
+                </div>
                 <h4 style="margin: 0 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.88rem;">Model selector</h4>
                 <div class="select-wrap">
                   <select id="modelSelect">
