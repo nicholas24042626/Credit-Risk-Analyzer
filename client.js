@@ -124,6 +124,19 @@ function initApp() {
 
   function renderShap(model) {
     shapBars.innerHTML = "";
+
+    function getEffectDirection(effect) {
+      if (typeof effect === "number") {
+        return effect < 0 ? -1 : 1;
+      }
+
+      if (typeof effect === "string") {
+        return effect.toLowerCase().includes("away") ? -1 : 1;
+      }
+
+      return 1;
+    }
+
     const shapValues = (modelData[model]?.featureImportance || modelData[model]?.shap || [])
       .map((item) => {
         if (Array.isArray(item)) {
@@ -182,7 +195,7 @@ function initApp() {
     rankedValues.forEach((item, index) => {
       const label = item.feature;
       const value = item.absValue;
-      const direction = item.effect && item.effect.toLowerCase().includes("away") ? -1 : 1;
+      const direction = getEffectDirection(item.effect);
       const relativeWidth = maxValue ? (value / maxValue) * 100 : 0;
       const relativeStrength = maxValue ? Math.round((value / maxValue) * 100) : 0;
 
