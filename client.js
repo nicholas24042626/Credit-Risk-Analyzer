@@ -182,7 +182,7 @@ function initApp() {
     rankedValues.forEach((item, index) => {
       const label = item.feature;
       const value = item.absValue;
-      const direction = item.effect && item.effect.toLowerCase().includes("away") ? -1 : 1;
+      const direction = (item.effect === -1 || (typeof item.effect === 'string' && item.effect.toLowerCase().includes("away"))) ? -1 : 1;
       const relativeWidth = maxValue ? (value / maxValue) * 100 : 0;
       const relativeStrength = maxValue ? Math.round((value / maxValue) * 100) : 0;
 
