@@ -4,7 +4,10 @@
 
 This report details the design, iterative optimization, and evaluation of an XGBoost multiclass classifier for corporate credit rating prediction. The project addresses four core challenges in financial classification: industry-specific ratio baselines, extreme class imbalance, probability miscalibration, and data leakage.
 
-Through a systematic optimization process spanning eight distinct improvements — robust outlier handling, target class consolidation, domain-driven feature engineering, polynomial interaction terms, data-efficient calibration, expanded hyperparameter search, post-hoc threshold optimization, and 3-model soft-voting ensemble stacking — the final model achieved a **Macro F1 Score of 0.5408** and an **Accuracy of 72.17%** on a held-out test set, with a **Balanced Accuracy of 54.81%** and **ROC AUC (OVR) of 0.7119**. All preprocessing and feature engineering stages have been implemented with zero data leakage. One residual leakage point exists in the strategy selector (§4.6), which is documented and assessed in §13.1.
+Through a systematic optimization process spanning robust outlier handling, target class consolidation, domain-driven feature engineering, polynomial interaction terms, data-efficient calibration, expanded hyperparameter search, and 3-model soft-voting ensemble stacking, the model achieves — under **company-level, leakage-safe 5-fold cross-validation** — a **Macro F1 of 0.42 ± 0.03** and an **Accuracy of 0.46 ± 0.03**.
+
+> [!IMPORTANT]
+> Earlier versions of this report cited ~72% accuracy. That figure came from a **row-level train/test split that leaked company identity** (2,029 records span only 593 companies, so the same firm appeared in both train and test). Switching to a company-level grouped split corrects this; the honest cross-validated accuracy is ~46%. The strategy-selector leakage previously flagged in §4.6 has also been fixed (the threshold decision is now made on training data only). All preprocessing and feature-engineering parameters are fit on the training fold exclusively.
 
 ---
 
@@ -38,7 +41,7 @@ Financial ratios such as `debtEquityRatio`, `currentRatio`, and `operatingProfit
 
 ### 1.2 Extreme Class Imbalance
 
-The dataset exhibits severe class imbalance across the four target tiers. The Speculative class dominates with 172 test samples, while the Distressed class is represented by as few as 1 sample in the test set — a sample size at which precision, recall, and F1 are **statistically unmeasurable** rather than meaningfully zero. Standard accuracy metrics become misleading under such distributions, as a model that predicts only the majority class can achieve superficially high accuracy.
+The dataset exhibits severe class imbalance across the four target tiers. On a representative held-out split the Speculative class holds ~159 test samples, while the Distressed tier (CCC, CC, C, D) holds ~15. Standard accuracy metrics become misleading under such distributions, as a model that predicts only the majority class can achieve superficially high accuracy — which is why this report leads with macro-averaged and per-class metrics under cross-validation rather than a single-split accuracy.
 
 ### 1.3 Probability Miscalibration
 
@@ -81,8 +84,8 @@ Raw credit ratings are collapsed into four financially meaningful tiers via the 
 |---|---|---|
 | **Investment-High** | AAA, AA, A | Highest creditworthiness; minimal default risk |
 | **Investment-Low** | BBB | Adequate capacity; moderate vulnerability to adverse conditions |
-| **Speculative** | BB, B, CCC, CC | Significant credit risk; speculative-grade |
-| **Distressed** | C, D | Near-default or in default; recovery analysis territory |
+| **Speculative** | BB, B | Significant credit risk; speculative-grade |
+| **Distressed** | CCC, CC, C, D | Substantial credit risk through near-default/default; the CCC/CC "highly speculative" grades are grouped here rather than with Speculative |
 
 Records with unrecognized or missing ratings are labelled `Unknown` and excluded from training.
 
@@ -101,17 +104,28 @@ This avoids the non-determinism of scikit-learn's `LabelEncoder`, which assigns 
 
 ### 2.4 Train–Test Split
 
-The dataset is split 80/20 with stratified sampling (`stratify=y_encoded`) to preserve class proportions in both partitions. A fallback to non-stratified splitting is provided for edge cases where a class has too few members to stratify. The random seed is fixed at `RANDOM_STATE = 143` for full reproducibility.
+The dataset contains **2,029 company–year records but only 593 unique companies** (~3.4 records per company). A naive random or stratified row split therefore leaks: the same company's other years land in both the training and test partitions, letting the model partially memorize company identity and inflating measured accuracy.
+
+To prevent this, the pipeline uses a **company-level, stratified group split** (`StratifiedGroupKFold`, keyed on `Symbol`/`Name`): all records for a given company are confined to one side of the split, while class proportions are still balanced across folds. A single ~20% held-out fold is used for the single-split report, and the split degrades gracefully to a stratified then a plain split if grouping is unavailable. The random seed is fixed at `RANDOM_STATE = 143`.
+
+> [!NOTE]
+> Removing company-level leakage lowers the headline accuracy substantially (from ~0.72 under a leaky row split to ~0.53 under the grouped split). The lower number is the honest one. Because a single grouped split over ~118 test companies is high-variance, the authoritative performance figure in §5 is a **grouped k-fold cross-validation mean**, not a single split.
 
 ### 2.5 Identifier Dropping
 
-Non-predictive columns (`Name`, `Symbol`, `Rating Agency Name`, `Date`, `RatingClass`, `Rating`) are explicitly dropped before any feature computation, ensuring no target-correlated metadata leaks into the feature space.
+Non-predictive columns (`Name`, `Symbol`, `Rating Agency Name`, `Date`, `RatingClass`, `Rating`) are explicitly dropped before any feature computation, ensuring no target-correlated metadata leaks into the feature space. The `Symbol`/`Name` identifier is captured as the grouping key for the company-level split (§2.4) *before* it is dropped from the feature matrix.
 
 ---
 
 ## 3. Feature Engineering Pipeline
 
 The feature engineering pipeline is a multi-stage transformation applied **exclusively on the training set**, with learned parameters then applied to the test set. This guarantees zero data leakage.
+
+The full ordered pipeline is: **median imputation → winsorization → interaction/log features → sector z-scores → one-hot encoding & alignment → feature selection**. Every fitted parameter (medians, winsorize bounds, sector statistics, feature columns, selected features) is computed on the training fold only and persisted for identical reapplication at inference.
+
+### 3.0 Missing-Value Imputation
+
+Numeric missing values are filled with **per-column medians computed on the training fold** (`fit_imputation`/`apply_imputation`). While XGBoost can natively route NaNs, explicit imputation is applied first so that the downstream sector z-score step produces well-defined values instead of propagating NaNs. Columns that are entirely missing default to 0.0.
 
 ### 3.1 Winsorization (Outlier Capping)
 
@@ -212,6 +226,15 @@ After the full pipeline, the feature space expands from approximately 30 raw fea
 - ~55 sector-relative z-score features (covering all numeric columns including new interactions)
 - ~12 sector one-hot columns
 
+### 3.7 Feature Selection
+
+To curb the overfitting risk of a ~130-feature space on ~2,000 rows, a training-fold-only selection step (`fit_feature_selection`) prunes:
+
+1. **Near-zero-variance columns** (variance ≤ 1e-8) — features with no discriminative signal.
+2. **Redundant columns** — one of every pair with absolute Pearson correlation > 0.95.
+
+The retained column list is persisted as `feature_columns` and reapplied at inference, so training and serving always see an identical, reduced feature set.
+
 ---
 
 ## 4. Training & Validation Architecture
@@ -293,8 +316,8 @@ prediction = argmax(adjusted_probabilities)
 
 The optimization uses Nelder-Mead simplex search with 10 random restarts to escape local optima. Thresholds are normalized to sum to `n_classes`, preserving the probability scale.
 
-> [!WARNING]
-> **Known data leakage**: The **strategy selector** compares the Macro F1 of threshold-optimized predictions against standard predictions **on the test set** to decide which strategy to persist. This means the binary choice of whether to apply thresholds is informed by test-set labels — a form of threshold optimization leakage identified in §1.4. While the threshold *values* themselves are learned exclusively on training data (no leakage), the *decision to use them* is not. This introduces an optimistic bias in the reported test-set metrics, though the magnitude is bounded (it can only choose between two fixed prediction strategies, not tune continuous parameters). See §13.1 for proposed fixes.
+> [!NOTE]
+> **Resolved leakage**: The **strategy selector** previously compared the Macro F1 of threshold-optimized vs. standard predictions **on the test set** to decide which strategy to persist — leaking test labels into that binary choice. It now makes the decision using **training-set Macro F1 only**, so neither the threshold values nor the decision to use them touches test data. Empirically this removed roughly 1–2 points of optimistic bias from the single-split accuracy.
 
 ### 4.7 Model Caching
 
@@ -304,10 +327,10 @@ All trained artifacts are persisted via `joblib` for instant reload:
 |---|---|---|
 | Calibrated ensemble | `calibrated_model.pkl` | Calibrated VotingClassifier for inference predictions |
 | Base XGBoost model | `base_model.pkl` | Best single XGBoost for SHAP explanations (TreeExplainer requires uncalibrated model) |
-| Ensemble model | `ensemble_model.pkl` | Uncalibrated 3-model VotingClassifier |
+| Imputer medians | `imputer_medians.pkl` | Per-column training medians for missing-value imputation |
 | Winsorization bounds | `winsorize_bounds.pkl` | Consistent outlier capping |
 | Sector statistics | `sector_stats.pkl` | Z-score normalization parameters |
-| Feature columns | `feature_columns.pkl` | Column alignment during inference |
+| Feature columns | `feature_columns.pkl` | Selected feature list (post-selection) for column alignment during inference |
 | Optimal thresholds | `optimal_thresholds.pkl` | Post-hoc decision boundaries |
 | Prediction strategy | `prediction_strategy.pkl` | Whether thresholds improve performance |
 
@@ -319,30 +342,37 @@ Cache keys are derived from an MD5 hash of the uploaded file data, enabling per-
 
 ### 5.1 Test Set Performance
 
-| Metric | Value |
+Authoritative figures are from **grouped, stratified 5-fold cross-validation** (company-level, leakage-safe; standard calibrated predictions via `evaluate_xgboost.py`):
+
+| Metric | CV Mean ± Std |
 |---|---|
-| **Accuracy** | 0.7217 |
-| **Balanced Accuracy** | 0.5481 |
-| **Macro F1** | 0.5408 |
-| **ROC AUC (OVR)** | 0.7119 |
+| **Accuracy** | 0.4603 ± 0.0313 |
+| **Macro F1** | 0.4181 ± 0.0308 |
+
+Per-class F1 (CV mean): Investment-High 0.5546 · Investment-Low 0.3642 · Speculative 0.4997 · Distressed 0.2537.
+
+For reference, the single representative held-out split (seed 143, leakage-free path) used for the confusion matrix (§7) and classification report (§5.2) scores **accuracy 0.5222 / macro F1 0.4350** — above the CV mean, which illustrates why a single grouped split over ~118 test companies is not a reliable estimate on its own.
 
 ### 5.2 Per-Class Classification Report
 
+Representative held-out grouped split (seed 143), 406 test samples — consistent with the confusion matrix in §7:
+
 | Class | Precision | Recall | F1-Score | Support |
 |---|---|---|---|---|
-| Investment-High | 0.6923 | 0.8182 | 0.7500 | 99 |
-| Investment-Low | 0.6056 | 0.6418 | 0.6232 | 134 |
-| Speculative | 0.8571 | 0.7326 | 0.7900 | 172 |
-| Distressed | 0.0000 | 0.0000 | 0.0000 | 1 |
-| **Weighted Avg** | **0.7318** | **0.7217** | **0.7232** | **406** |
+| Investment-High | 0.5570 | 0.4490 | 0.4972 | 98 |
+| Investment-Low | 0.4593 | 0.4627 | 0.4610 | 134 |
+| Speculative | 0.6168 | 0.6478 | 0.6319 | 159 |
+| Distressed | 0.1200 | 0.2000 | 0.1500 | 15 |
+| **Macro Avg** | **0.4382** | **0.4399** | **0.4350** | **406** |
+| **Weighted Avg** | **0.5320** | **0.5222** | **0.5252** | **406** |
 
 ### 5.3 Key Observations
 
-1. **Speculative class** achieves the highest F1 (0.7900) with notably high precision (0.8571), benefiting from both the largest support and distinct feature distributions.
-2. **Investment-High** shows strong recall (0.8182) indicating the model effectively identifies high-quality credits, though with somewhat lower precision (0.6923) due to over-prediction.
-3. **Investment-Low** is the most confused class (F1 = 0.6232), consistent with its position as a boundary class between Investment-High and Speculative.
-4. **Distressed** class reports 0.0 across all metrics, but with only 1 test sample these figures are **statistically unmeasurable** — a single observation cannot produce a meaningful precision/recall estimate. This is a data-acquisition gap, not a model failure (see §13.2 for the concrete remediation path of acquiring 10–20 additional C/D-rated records).
-5. The ensemble architecture improves **balanced accuracy** (0.5481) compared to a single-model approach, indicating better minority-class awareness.
+1. **Speculative** achieves the highest F1 (0.6319), benefiting from the largest support and relatively distinct feature distributions.
+2. **Investment-High** is moderate (F1 0.4972) with precision 0.5570 but recall only 0.4490 — many high-quality credits are misread as Investment-Low.
+3. **Investment-Low** is a weak boundary tier (F1 0.4610), frequently misread as Speculative (42 cases) or Investment-High (29 cases).
+4. **Distressed** is now genuinely measurable (F1 0.1500, recall 0.2000, 3/15 caught). Weak but real signal — no longer the unmeasurable n=1 artifact of the previous grouping.
+5. These are single-split figures and vary meaningfully across folds; the cross-validation mean in §5.1 is the figure to cite.
 
 ---
 
@@ -371,34 +401,34 @@ The confusion matrix reveals the model's misclassification patterns across the f
 ```
                   Predicted
                   IH    IL    SP    DI
-Actual IH     [  81   16     2     0 ]
-       IL     [  30   86    18     0 ]
-       SP     [   6   40   126     0 ]
-       DI     [   0    0     1     0 ]
+Actual IH     [  44   41    11     2 ]
+       IL     [  29   62    42     1 ]
+       SP     [   5   32   103    19 ]
+       DI     [   1    0    11     3 ]
 ```
 
-*(IH = Investment-High, IL = Investment-Low, SP = Speculative, DI = Distressed)*
+*(IH = Investment-High, IL = Investment-Low, SP = Speculative, DI = Distressed. Representative held-out grouped split, seed 143, leakage-free prediction path; 406 test samples; accuracy 212/406 = 0.5222. Exact single-split values vary ~±1 point between runs due to the multithreading non-determinism noted in §11.1; this snapshot matches the persisted `results/` artifacts. The authoritative figure is the 5-fold CV mean in §5.1.)*
 
 ### 7.1 Misclassification Patterns
 
-- **Investment-High ↔ Investment-Low** boundary is the primary confusion zone (16 IH→IL, 30 IL→IH). These adjacent classes share overlapping financial profiles.
-- **Investment-Low ↔ Speculative** boundary is the second major source of error (18 IL→SP, 40 SP→IL), reflecting the inherent difficulty of the BBB/BB boundary — the "fallen angel" threshold in credit risk.
-- **Distressed** class (0/1 correct) is unmeasurable at n=1. No supervised model can learn or be meaningfully evaluated on a single sample; this is a data-availability constraint, not a model architecture issue (see §13.2).
-- The model rarely makes **extreme misclassifications** (e.g., IH→DI or DI→IH = 0), indicating that the learned feature space preserves ordinal credit quality structure.
+- **Investment-High ↔ Investment-Low** boundary is a primary confusion zone (41 IH→IL, 29 IL→IH). These adjacent classes share overlapping financial profiles.
+- **Investment-Low ↔ Speculative** boundary is a major source of error (42 IL→SP, 32 SP→IL), reflecting the inherent difficulty of the BBB/BB boundary — the "fallen angel" threshold in credit risk.
+- **Distressed** is now a measurable class (15 test samples, 3 correctly identified — recall 0.20, F1 ≈ 0.15). Performance is weak but genuine, no longer a data-availability artifact: the CCC/CC/C/D grouping gives the tier enough support to learn from and evaluate.
+- Most confusions are between **adjacent tiers**; extreme misclassifications are rare (IH→DI = 2, DI→IH = 1), indicating the learned feature space largely preserves ordinal credit-quality structure.
 
 ### 7.2 Cost-Weighted Analysis
 
-In banking applications, not all misclassifications carry equal cost. Under a typical asymmetric cost matrix where upgrading risk (predicting higher quality than actual) is penalized 3× more than downgrading:
+In banking applications, not all misclassifications carry equal cost: **upgrades** (predicting higher credit quality than the truth) are riskier than **downgrades**, so they carry heavier weights. Applying illustrative asymmetric weights to the representative-split confusion matrix (§7):
 
 | Misclassification Type | Cost Weight | Frequency | Weighted Cost |
 |---|---|---|---|
-| Upgrade by 1 tier | 2× | 71 | 142 |
+| Upgrade by 1 tier | 2× | 72 | 144 |
 | Upgrade by 2+ tiers | 5× | 6 | 30 |
-| Downgrade by 1 tier | 1× | 34 | 34 |
-| Downgrade by 2+ tiers | 2× | 2 | 4 |
-| **Total Weighted Cost** | | | **210** |
-| **Maximum Possible Cost** | | | **~1,357** |
-| **Cost Efficiency** | | | **~84.52%** |
+| Downgrade by 1 tier | 1× | 102 | 102 |
+| Downgrade by 2+ tiers | 2× | 14 | 28 |
+| **Total** | | **194 errors** | **304** |
+
+The error profile skews toward **downgrades (116) over upgrades (78)** — the safer direction in credit risk, since the model errs toward caution more often than toward over-optimism. (Weights are illustrative; a production deployment would calibrate them to the institution's actual loss matrix rather than report a single "cost-efficiency" percentage.)
 
 ---
 
@@ -413,6 +443,9 @@ SHAP values are computed on the **uncalibrated base XGBoost model** (not the Cal
 ### 8.2 Top Feature Importances (Global)
 
 The following table shows the top 15 features ranked by global XGBoost feature importance (from the best base model in the ensemble):
+
+> [!WARNING]
+> These importance values were produced by an **earlier training run** (pre-dating the company-level split, the CCC/CC→Distressed regrouping, and feature selection). They are retained here for illustration but should be **regenerated** from the current model before being cited. Instance-level SHAP served by the live dashboard already reflects the current model.
 
 | Rank | Feature | Importance |
 |---|---|---|
@@ -495,29 +528,32 @@ Browser → Node.js Server (port 3000) → Python subprocess → JSON response
 }
 ```
 
-**Response**:
+**Response** (values from the representative held-out grouped split, seed 143; the confusion matrix and metrics match §5 and §7 exactly):
 ```json
 {
-  "prediction": "Speculative",
+  "prediction": "Investment-Low",
   "probabilities": {
-    "Investment-High": 0.12,
-    "Investment-Low": 0.23,
-    "Speculative": 0.58,
-    "Distressed": 0.07
+    "Investment-High": 0.39,
+    "Investment-Low": 0.45,
+    "Speculative": 0.08,
+    "Distressed": 0.08
   },
   "modelData": {
     "tag": "XGBoost",
     "labels": ["Investment-High", "Investment-Low", "Speculative", "Distressed"],
-    "metrics": { "accuracy": "0.7241", "precision": "0.7219", "recall": "0.7241", "f1": "0.7229" },
-    "matrix": [[75,20,4,0],[22,82,30,0],[7,29,137,0],[0,0,1,0]],
-    "shap": [["Cashflow Debt Coverage", 95.0, 1], ...],
+    "metrics": { "accuracy": "0.5222", "precision": "0.5320", "recall": "0.5222", "f1": "0.5252" },
+    "matrix": [[44,41,11,2],[29,62,42,1],[5,32,103,19],[1,0,11,3]],
+    "shap": [["Debt Service Ratio (Sector Z-Score)", 95.0, 1], ...],
     "shapStory": {
-      "positive": ["Cashflow Debt Coverage", "Debt Ratio", "Current Ratio"],
-      "negative": ["Net Profit Margin", "Effective Tax Rate"]
+      "positive": ["Debt Service Ratio (Sector Z-Score)", "Cashflow Debt Coverage", "Gross Profit Margin (Sector Z-Score)"],
+      "negative": ["Payables Turnover", "Free Cash Flow Operating Cash Flow Ratio (Sector Z-Score)"]
     }
   }
 }
 ```
+
+> [!NOTE]
+> `precision`/`recall`/`f1` are **weighted averages** over the held-out test set (recall equals accuracy for weighted averaging). The `matrix` rows are actual-class counts summing to per-class support (98 / 134 / 159 / 15 = 406).
 
 ### 10.4 Model Caching for Production
 
@@ -544,11 +580,14 @@ The frontend (`views/index.html` + `client.js`) provides a single-page dashboard
 
 ### 11.1 Random Seed
 
-All stochastic operations use `RANDOM_STATE = 143`:
+All stochastic operations are seeded with `RANDOM_STATE = 143`:
 
-- `train_test_split` stratification
-- `XGBClassifier` random state
-- Nelder-Mead threshold optimization (10 restarts with `np.random.uniform`)
+- `StratifiedGroupKFold` shuffling for the company-level split (§2.4)
+- All three `XGBClassifier` seeds (base model 143, ensemble members 144/145). *Note: the base model previously had no explicit seed — a reproducibility bug that has been fixed.*
+- Nelder-Mead threshold optimization (10 restarts seeded via `np.random.default_rng(143)`)
+
+> [!NOTE]
+> **Residual non-determinism.** Even with all seeds fixed, XGBoost trained with `n_jobs=-1` exhibits minor run-to-run variance (observed ~±1 percentage point in single-split accuracy, e.g. 0.5148 vs 0.5222) due to non-deterministic floating-point reduction order across threads. This is why §5 reports a **cross-validation mean ± std** as the authoritative figure rather than any single run. Bit-exact reproducibility would require single-threaded training (`n_jobs=1`), traded off against speed.
 
 ### 11.2 Software Dependencies
 
@@ -568,13 +607,16 @@ All stochastic operations use `RANDOM_STATE = 143`:
 
 | Pipeline Stage | Leakage-Free? | Mechanism |
 |---|---|---|
+| Train/test split (company overlap) | ✅ | Company-level `StratifiedGroupKFold` on `Symbol`/`Name`; no company appears in both partitions (fixes prior row-level leakage across the 593 companies × 2,029 records) |
+| Median imputation | ✅ | Medians computed on `X_train` only; stored and reapplied |
+| Feature selection | ✅ | Variance/correlation pruning fit on `X_train` only; selected columns persisted |
 | Winsorization bounds | ✅ | Computed on `X_train` only; stored and reapplied |
 | Sector z-score statistics | ✅ | Sector means/stds from `X_train`; persisted in `sector_stats.pkl` |
 | Interaction features | ✅ | Deterministic formula; no data-dependent parameters |
 | Log transforms | ✅ | Deterministic formula; no fitted parameters |
 | One-hot encoding | ✅ | Column alignment via `reindex` with `fill_value=0` |
 | Threshold optimization (values) | ✅ | Nelder-Mead optimization uses `y_train` and `calibrated_model.predict_proba(X_train_enc)` only |
-| Threshold strategy selector | ⚠️ | **Leakage**: binary choice (use thresholds vs. standard) is decided by comparing F1 on `y_test` — see §4.6 |
+| Threshold strategy selector | ✅ | Fixed: the use-thresholds decision now compares Macro F1 on `y_train` only — see §4.6 |
 | Sample weight computation | ✅ | Computed on `y_train` class frequencies only |
 
 ---
@@ -652,7 +694,7 @@ Throughout the development of this pipeline, several techniques were explored bu
 **Why the change**:
 - A single XGBoost model exhibits seed-dependent variance — the same hyperparameters can produce measurably different predictions depending on the random state.
 - Soft-voting across 3 models averages out this variance, producing more stable probability estimates. This is particularly impactful for borderline cases near the Investment-Low / Speculative boundary (the "fallen angel" threshold).
-- The improvement in balanced accuracy (0.5481 vs. single-model baseline) confirms that the ensemble reduces misclassification of minority classes.
+- The ensemble reduces prediction variance relative to a single seed-dependent model, which is most valuable for borderline minority-class cases.
 
 ### 12.9 Exhaustive GridSearchCV → RandomizedSearchCV
 
@@ -671,8 +713,8 @@ Throughout the development of this pipeline, several techniques were explored bu
 
 ### 13.1 Current Limitations
 
-1. **Strategy selector data leakage**: The strategy selector (§4.6) compares threshold-optimized vs. standard predictions using **test-set F1** to decide which to persist. This is a direct form of the threshold optimization leakage described in §1.4. The leakage is bounded — it selects between two fixed strategies rather than tuning continuous parameters — but it optimistically biases reported metrics. **Fix**: The selector should compare strategies using training-set or cross-validated F1 only, or default to always applying thresholds (since they are trained on training data and rarely hurt).
-2. **Distressed class data gap**: The Distressed tier has ≤5 training samples and 1 test sample, making all per-class metrics (precision, recall, F1) **statistically unmeasurable** rather than meaningfully zero. This is a data-acquisition gap, not a modeling weakness — no supervised method can learn or evaluate a class at this sample size. SMOTE was tested and abandoned (see §12.1). Acquiring 10–20 additional C/D-rated records (see §13.2) is the prerequisite before Distressed-class performance can be assessed.
+1. **Model performance is modest**: The honest cross-validated accuracy is ~46% (macro F1 ~0.42) on a hard, imbalanced 4-class problem with only 593 distinct companies. This is a realistic ceiling for this feature set and sample size, not a bug — but it is far from the inflated ~72% that a leaky split produced. Meaningful gains most likely require more data (especially low-grade issuers) and temporal features rather than further tuning. *(The strategy-selector test-set leakage noted in earlier revisions has been fixed — see §4.6.)*
+2. **Weak Distressed-class performance**: Grouping CCC/CC/C/D together raises the Distressed tier to ~72 records (~15 per test fold), which makes it measurable — the model now actually predicts it (recall ≈ 0.20, F1 ≈ 0.15 on the representative split; CV-mean F1 ≈ 0.25). Performance is still weak and high-variance given the modest support, but this is now a genuine modeling/data-volume challenge rather than the earlier "unmeasurable at n=1" artifact. SMOTE was tested and abandoned (see §12.1); acquiring more genuine low-grade records remains the highest-leverage improvement.
 3. **Static sector definitions**: The model does not account for sector reclassification or conglomerate companies spanning multiple industries.
 4. **Single-period prediction**: The model treats each company–year record independently, without temporal modeling of credit trajectory.
 5. **Calibration data requirements**: Isotonic calibration with 3-fold CV requires at least 3 samples per class per fold. The automatic fallback to 2-fold mitigates this but reduces calibration quality for rare classes.
@@ -686,7 +728,7 @@ Throughout the development of this pipeline, several techniques were explored bu
 3. **Ordinal regression head**: Replacing `multi:softprob` with an ordinal-aware loss function that respects the inherent ordering of credit tiers (IH > IL > SP > DI).
 4. **Cross-model ensemble stacking**: Combining XGBoost predictions with Random Forest and Logistic Regression via a meta-learner for model diversity beyond seed variation.
 5. **Feature selection**: Applying Boruta or recursive feature elimination to prune the ~130-feature space and reduce overfitting risk.
-6. **K-fold cross-validation evaluation**: Moving from a single train/test split to 5-fold stratified cross-validation for more robust performance estimates.
+6. **K-fold cross-validation evaluation** *(implemented)*: `evaluate_xgboost.py` now runs grouped, stratified 5-fold cross-validation and reports mean ± std, replacing the fragile single-split estimate as the authoritative performance figure (§5.1).
 7. **Dynamic threshold adaptation**: Implementing online threshold recalibration at inference time based on recent prediction distributions.
 
 ---
@@ -699,9 +741,9 @@ The optimized XGBoost credit rating prediction pipeline demonstrates that system
 2. **A 3-model soft-voting ensemble** with isotonic probability calibration and post-hoc threshold optimization that adapts decision boundaries to class imbalance.
 3. **Expanded hyperparameter search** via `RandomizedSearchCV` with aggressive regularization parameters (`gamma`, `reg_alpha`, `reg_lambda`) scored on Macro F1.
 4. **Production-ready deployment** via a Node.js server with Python subprocess inference, MD5-based model caching, and an interactive web dashboard with SHAP-based explanations.
-5. **Full reproducibility** through fixed random seeds, deterministic label encoding, and comprehensive artifact serialization.
+5. **Near-full reproducibility** through fixed random seeds, deterministic label encoding, and comprehensive artifact serialization (with minor residual variance from multithreaded XGBoost — see §11.1).
 
-The model achieves a **Macro F1 of 0.5408** and **Accuracy of 72.17%**, with the strongest performance on the Speculative tier (F1 = 0.7900, Precision = 0.8571). Distressed-tier metrics are statistically unmeasurable at n=1 and represent a data-acquisition gap rather than a modeling limitation (see §13.2 for remediation).
+Under company-level, leakage-safe 5-fold cross-validation the model achieves a **Macro F1 of 0.42 ± 0.03** and **Accuracy of 0.46 ± 0.03**, strongest on the Speculative and Investment-High tiers. The Distressed tier (CCC/CC/C/D) is now measurable, with weak but genuine signal. This headline is deliberately conservative: it reflects performance with no company-level or threshold-selection leakage, unlike the ~72% figure reported before those issues were corrected.
 
 ---
 
@@ -740,21 +782,23 @@ Credit-Risk-Analyzer/
     ├── logistic_regression_stuff/
     │   └── predict_logistic_regression.py
     └── xgboost_stuff/
-        ├── predict_xgboost.py      # Full XGBoost ensemble training & inference pipeline
-        ├── results/                # Cached models, metrics, and reports
+        ├── preprocessing.py        # Shared, leakage-safe preprocessing (split, impute, features, selection)
+        ├── predict_xgboost.py      # XGBoost ensemble training & single-split inference pipeline
+        ├── evaluate_xgboost.py     # Grouped k-fold cross-validation (authoritative metrics)
+        ├── results/                # Cached models + regenerated evaluation outputs
         │   ├── calibrated_model_<hash>.pkl
         │   ├── base_model_<hash>.pkl
-        │   ├── ensemble_model_<hash>.pkl
+        │   ├── imputer_medians_<hash>.pkl
         │   ├── winsorize_bounds_<hash>.pkl
         │   ├── sector_stats_<hash>.pkl
         │   ├── feature_columns_<hash>.pkl
         │   ├── optimal_thresholds_<hash>.pkl
         │   ├── prediction_strategy_<hash>.pkl
-        │   ├── xgboost_metrics.txt
+        │   ├── xgboost_metrics.txt              # single-split accuracy / macro-F1
         │   ├── xgboost_classification_report.csv
-        │   ├── xgboost_feature_importance.csv
-        │   └── xgboost_test_predictions.csv
-        └── figures/                # Diagnostic visualizations
+        │   ├── xgboost_test_predictions.csv
+        │   └── xgboost_cv_metrics.txt           # authoritative CV mean ± std
+        └── figures/                # Diagnostic visualizations (regenerate from the notebook after retraining)
             ├── class_distribution.png
             ├── confusion_matrix.png
             ├── feature_importance.png

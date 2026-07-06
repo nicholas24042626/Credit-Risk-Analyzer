@@ -1,13 +1,11 @@
 import sys
 import json
-import re
 import warnings
 import hashlib
 import base64
 import io
 import os
 import tempfile
-from functools import lru_cache
 from pathlib import Path
 
 import joblib
@@ -24,257 +22,36 @@ from sklearn.metrics import (
     f1_score,
     precision_recall_fscore_support,
 )
-from sklearn.model_selection import RandomizedSearchCV, train_test_split
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.model_selection import RandomizedSearchCV
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
 
+# All data-transformation logic lives in the shared preprocessing module so the
+# production pipeline and the training notebook stay in sync.
+from preprocessing import (
+    LABEL_ENCODER,
+    RANDOM_STATE,
+    DROP_COLS,
+    add_interaction_features,
+    apply_imputation,
+    apply_winsorize_bounds,
+    apply_zscore_from_stats,
+    compute_sector_stats,
+    encode_and_align,
+    extract_groups,
+    fit_feature_selection,
+    fit_imputation,
+    format_prediction_label,
+    group_rating,
+    humanize_feature_name,
+    make_split,
+    winsorize_features,
+)
+
 warnings.filterwarnings("ignore")
 
-RANDOM_STATE = 143
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 DEFAULT_DATASET_PATH = Path(__file__).resolve().parents[2] / "set A corporate_rating.csv"
-
-
-# ---------------------------------------------------------------------------
-# Label encoding
-# ---------------------------------------------------------------------------
-
-class ExplicitLabelEncoder:
-    """Deterministic label encoder with a fixed class → index mapping."""
-
-    def __init__(self, mapping):
-        self.mapping = mapping
-        self.classes_ = np.array(
-            [c for c, _ in sorted(mapping.items(), key=lambda x: x[1])]
-        )
-
-    def transform(self, y):
-        return np.array([self.mapping[val] for val in y])
-
-    def inverse_transform(self, y):
-        return np.array([self.classes_[val] for val in y])
-
-
-LABEL_ENCODER = ExplicitLabelEncoder({
-    "Investment_High": 0,
-    "Investment_Low": 1,
-    "Speculative": 2,
-    "Distressed": 3,
-})
-
-
-# ---------------------------------------------------------------------------
-# Feature helpers
-# ---------------------------------------------------------------------------
-
-def group_rating(r):
-    """Collapse granular credit ratings into four financial risk tiers.
-
-    Investment_High : AAA, AA, A
-    Investment_Low  : BBB
-    Speculative     : BB, B, CCC, CC
-    Distressed      : C, D
-    """
-    r = str(r).strip().upper()
-    if r in {"AAA", "AA", "A"}:
-        return "Investment_High"
-    if r == "BBB":
-        return "Investment_Low"
-    if r in {"BB", "B", "CCC", "CC"}:
-        return "Speculative"
-    if r in {"C", "D"}:
-        return "Distressed"
-    return "Unknown"
-
-
-def format_prediction_label(label):
-    return str(label).replace("_", "-")
-
-
-@lru_cache(maxsize=256)
-def humanize_feature_name(name):
-    """Convert a feature name to human-readable format. Cached for repeated calls."""
-    is_log = "_log" in name
-    is_sec = "_sec_z" in name
-    base = name.replace("_log", "").replace("_sec_z", "")
-    base = re.sub(r"(?<!^)(?=[A-Z])", " ", base).replace("_", " ")
-    base = re.sub(r"\s+", " ", base).strip().title()
-    suffix = (" (Log)" if is_log else "") + (" (Sector Z-Score)" if is_sec else "")
-    return f"{base}{suffix}"
-
-
-# ---------------------------------------------------------------------------
-# Feature engineering
-# ---------------------------------------------------------------------------
-
-_LOG_CANDIDATES = frozenset([
-    "currentRatio", "quickRatio", "cashRatio", "daysOfSalesOutstanding",
-    "debtEquityRatio", "enterpriseValueMultiple", "operatingCashFlowPerShare",
-    "freeCashFlowPerShare", "cashPerShare", "payablesTurnover",
-    "fixedAssetTurnover", "companyEquityMultiplier",
-])
-
-
-def winsorize_features(X_train, X_test, lower_pct=1, upper_pct=99):
-    """Clip numeric columns to [lower_pct, upper_pct] percentiles from training data."""
-    numerics = X_train.select_dtypes(include="number").columns
-    bounds = {}
-    for col in numerics:
-        lo = np.percentile(X_train[col].dropna(), lower_pct)
-        hi = np.percentile(X_train[col].dropna(), upper_pct)
-        bounds[col] = (lo, hi)
-
-    X_train_out = X_train.copy()
-    X_test_out = X_test.copy()
-    for col, (lo, hi) in bounds.items():
-        X_train_out[col] = X_train_out[col].clip(lower=lo, upper=hi)
-        X_test_out[col] = X_test_out[col].clip(lower=lo, upper=hi)
-
-    return X_train_out, X_test_out, bounds
-
-
-def apply_winsorize_bounds(X_train, X_test, bounds):
-    """Apply pre-computed winsorize bounds (cache path)."""
-    X_train_out = X_train.copy()
-    X_test_out = X_test.copy()
-    for col, (lo, hi) in bounds.items():
-        if col in X_train_out.columns:
-            X_train_out[col] = X_train_out[col].clip(lower=lo, upper=hi)
-        if col in X_test_out.columns:
-            X_test_out[col] = X_test_out[col].clip(lower=lo, upper=hi)
-    return X_train_out, X_test_out
-
-
-def add_interaction_features(X):
-    """Add 10 composite financial ratios and log-transformed skewed columns."""
-    out = X.copy()
-    cols = set(out.columns)
-
-    def safe_div(a, b_col):
-        return (out[a] / (out[b_col].abs() + 1e-5)).clip(-1e6, 1e6)
-
-    # Original 10 composite features
-    if {"debtEquityRatio", "operatingProfitMargin"} <= cols:
-        out["leverage_coverage"] = safe_div("debtEquityRatio", "operatingProfitMargin")
-    if {"currentRatio", "quickRatio", "cashRatio"} <= cols:
-        out["liquidity_score"] = (out["currentRatio"] + out["quickRatio"] + out["cashRatio"]) / 3.0
-    if {"operatingCashFlowPerShare", "debtEquityRatio"} <= cols:
-        out["cashflow_debt_coverage"] = safe_div("operatingCashFlowPerShare", "debtEquityRatio")
-    if {"netProfitMargin", "operatingProfitMargin", "grossProfitMargin"} <= cols:
-        out["profitability_composite"] = (
-            out["netProfitMargin"] + out["operatingProfitMargin"] + out["grossProfitMargin"]
-        ) / 3.0
-    if {"operatingCashFlowSalesRatio", "debtRatio"} <= cols:
-        out["debt_service_ratio"] = (
-            out["operatingCashFlowSalesRatio"] / (out["debtRatio"] + 1e-5)
-        ).clip(-1e6, 1e6)
-    if {"assetTurnover", "fixedAssetTurnover"} <= cols:
-        out["efficiency_composite"] = (out["assetTurnover"] + out["fixedAssetTurnover"]) / 2.0
-    if {"returnOnAssets", "debtRatio"} <= cols:
-        out["roa_leverage"] = (out["returnOnAssets"] / (out["debtRatio"] + 1e-5)).clip(-1e6, 1e6)
-    if {"grossProfitMargin", "netProfitMargin"} <= cols:
-        out["margin_stability"] = (out["grossProfitMargin"] - out["netProfitMargin"]).abs()
-    if {"cashRatio", "currentRatio"} <= cols:
-        out["cash_liquidity_ratio"] = safe_div("cashRatio", "currentRatio")
-    if {"returnOnCapitalEmployed", "assetTurnover"} <= cols:
-        out["equity_efficiency"] = (
-            out["returnOnCapitalEmployed"] * out["assetTurnover"]
-        ).clip(-1e6, 1e6)
-
-    # NEW: Credit-risk specific features
-    if {"currentRatio", "debtEquityRatio"} <= cols:
-        out["liquidity_leverage"] = (out["currentRatio"] / (out["debtEquityRatio"] + 1e-5)).clip(-1e6, 1e6)
-    if {"returnOnEquity", "returnOnAssets"} <= cols:
-        out["roe_roa_spread"] = (out["returnOnEquity"] - out["returnOnAssets"]).clip(-1e6, 1e6)
-    if {"operatingProfitMargin", "netProfitMargin"} <= cols:
-        out["margin_compression"] = (out["operatingProfitMargin"] - out["netProfitMargin"]).clip(-1e6, 1e6)
-    if {"freeCashFlowPerShare", "cashPerShare"} <= cols:
-        out["fcf_cash_ratio"] = safe_div("freeCashFlowPerShare", "cashPerShare")
-    if {"returnOnAssets", "assetTurnover"} <= cols:
-        out["roa_turnover"] = (out["returnOnAssets"] * out["assetTurnover"]).clip(-1e6, 1e6)
-    if {"debtRatio", "effectiveTaxRate"} <= cols:
-        out["debt_tax_burden"] = (out["debtRatio"] * (1 - out["effectiveTaxRate"])).clip(-1e6, 1e6)
-    if {"cashRatio", "debtEquityRatio"} <= cols:
-        out["cash_leverage"] = safe_div("cashRatio", "debtEquityRatio")
-    if {"operatingCashFlowSalesRatio", "netProfitMargin"} <= cols:
-        out["cash_quality"] = safe_div("operatingCashFlowSalesRatio", "netProfitMargin")
-
-    # Polynomial interactions for top 3 credit signals
-    if {"debtEquityRatio"} <= cols:
-        out["debtEquityRatio_sq"] = (out["debtEquityRatio"] ** 2).clip(-1e6, 1e6)
-    if {"returnOnAssets"} <= cols:
-        out["returnOnAssets_sq"] = (out["returnOnAssets"] ** 2).clip(-1e6, 1e6)
-    if {"currentRatio"} <= cols:
-        out["currentRatio_sq"] = (out["currentRatio"] ** 2).clip(-1e6, 1e6)
-
-    # Log transforms
-    for col in _LOG_CANDIDATES & cols:
-        out[f"{col}_log"] = np.sign(out[col]) * np.log1p(np.abs(out[col]))
-
-    return out
-
-
-def _compute_sector_stats(X_train_with_interactions):
-    """Compute per-sector mean/std needed for z-score features (train set only)."""
-    df = X_train_with_interactions
-    ratios = [
-        c for c in df.select_dtypes(include="number").columns
-        if "log" not in c and not c.startswith("Sector_")
-    ]
-    means = df.groupby("Sector")[ratios].mean()
-    stds = df.groupby("Sector")[ratios].std().fillna(1.0)
-    return {
-        "means": means,
-        "stds": stds,
-        "global_means": df[ratios].mean(),
-        "global_stds": df[ratios].std().fillna(1.0),
-        "ratios": ratios,
-    }
-
-
-def _apply_zscore_from_stats(df_list, stats):
-    """Apply sector z-scores (in-place) to each DataFrame in df_list."""
-    means = stats["means"]
-    stds = stats["stds"]
-    global_means = stats["global_means"]
-    global_stds = stats["global_stds"]
-    ratios = stats["ratios"]
-
-    for df_out in df_list:
-        if "Sector" not in df_out.columns:
-            continue
-        m_sec = (
-            df_out[["Sector"]]
-            .merge(means, left_on="Sector", right_index=True, how="left")
-            .drop(columns=["Sector"])
-        )
-        s_sec = (
-            df_out[["Sector"]]
-            .merge(stds, left_on="Sector", right_index=True, how="left")
-            .drop(columns=["Sector"])
-        )
-        m_sec = m_sec.fillna(global_means)
-        s_sec = s_sec.fillna(global_stds)
-        z = (df_out[ratios] - m_sec) / (s_sec + 1e-5)
-        z.columns = [f"{r}_sec_z" for r in ratios]
-        for col in z.columns:
-            df_out[col] = z[col]
-
-
-def encode_and_align(X_train_z, X_test_z, feature_columns=None):
-    """One-hot encode Sector and align train/test columns."""
-    sector_col = ["Sector"] if "Sector" in X_train_z.columns else []
-    X_train_enc = pd.get_dummies(X_train_z, columns=sector_col)
-    X_test_enc = pd.get_dummies(X_test_z, columns=["Sector"] if "Sector" in X_test_z.columns else [])
-
-    if feature_columns is not None:
-        X_train_enc = X_train_enc.reindex(columns=feature_columns, fill_value=0)
-        X_test_enc = X_test_enc.reindex(columns=feature_columns, fill_value=0)
-    else:
-        X_train_enc, X_test_enc = X_train_enc.align(X_test_enc, join="left", axis=1, fill_value=0)
-
-    return X_train_enc, X_test_enc
 
 
 # ---------------------------------------------------------------------------
@@ -321,10 +98,10 @@ def _cache_paths(data_hash):
     suffix = "" if data_hash == "default" else f"_{data_hash}"
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     names = [
-        "calibrated_model", "base_model", "ensemble_model", "winsorize_bounds",
+        "calibrated_model", "base_model", "imputer_medians", "winsorize_bounds",
         "sector_stats", "feature_columns", "optimal_thresholds", "prediction_strategy",
     ]
-    return {name: RESULTS_DIR / f"{name.replace('_', '_')}{suffix}.pkl" for name in names}
+    return {name: RESULTS_DIR / f"{name}{suffix}.pkl" for name in names}
 
 
 def _cache_is_complete(paths):
@@ -372,6 +149,7 @@ def train_model(X_train_enc, y_train):
         subsample=0.8,
         colsample_bytree=0.8,
         colsample_bylevel=0.8,
+        random_state=RANDOM_STATE,  # Model 1 seed — required for reproducibility
         n_jobs=-1,
     )
 
@@ -386,7 +164,7 @@ def train_model(X_train_enc, y_train):
         "reg_lambda":       [1, 1.5],
     }
 
-    # Model 1 — best from RandomizedSearchCV (100 samples from the grid)
+    # Model 1 — best from RandomizedSearchCV (15 samples from the grid)
     grid = RandomizedSearchCV(
         estimator=base_model,
         param_distributions=param_grid,
@@ -405,7 +183,7 @@ def train_model(X_train_enc, y_train):
     best_params = grid.best_params_
     xgb_2 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 1, "n_jobs": -1})
     xgb_3 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 2, "n_jobs": -1})
-    
+
     xgb_2.fit(X_train_enc, y_train, sample_weight=sample_weights)
     xgb_3.fit(X_train_enc, y_train, sample_weight=sample_weights)
 
@@ -504,19 +282,16 @@ def main():
         df = df[valid_mask].copy()
         y_encoded = LABEL_ENCODER.transform(y_raw[valid_mask])
 
-        # ── Feature matrix ───────────────────────────────────────────────────
-        drop_cols = {"Name", "Symbol", "Rating Agency Name", "Date", "RatingClass", "Rating"}
-        X = df.drop(columns=[c for c in drop_cols if c in df.columns])
+        # Company-level grouping key (captured before identifier columns drop).
+        groups = extract_groups(df)
 
-        # ── Train / test split ───────────────────────────────────────────────
-        try:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y_encoded, test_size=0.20, random_state=RANDOM_STATE, stratify=y_encoded
-            )
-        except ValueError:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y_encoded, test_size=0.20, random_state=RANDOM_STATE
-            )
+        # ── Feature matrix ───────────────────────────────────────────────────
+        X = df.drop(columns=[c for c in DROP_COLS if c in df.columns])
+
+        # ── Train / test split (company-level, leakage-safe) ─────────────────
+        X_train, X_test, y_train, y_test, split_strategy = make_split(
+            X, y_encoded, groups=groups, test_size=0.20, random_state=RANDOM_STATE
+        )
 
         if len(X_train) == 0 or len(X_test) == 0:
             raise ValueError("Dataset is too small to split into training and test sets.")
@@ -530,46 +305,65 @@ def main():
             # ── Cache HIT: load artefacts ────────────────────────────────────
             calibrated_model = joblib.load(paths["calibrated_model"])
             best_xgb = joblib.load(paths["base_model"])
+            medians = joblib.load(paths["imputer_medians"])
             w_bounds = joblib.load(paths["winsorize_bounds"])
             sector_stats = joblib.load(paths["sector_stats"])
             feature_columns = joblib.load(paths["feature_columns"])
             optimal_thresholds = joblib.load(paths["optimal_thresholds"])
             use_thresholds = joblib.load(paths["prediction_strategy"]).get("use_thresholds", False)
 
-            X_train_w, X_test_w = apply_winsorize_bounds(X_train, X_test, w_bounds)
+            X_train_m = apply_imputation(X_train, medians)
+            X_test_m = apply_imputation(X_test, medians)
+            X_train_w, X_test_w = apply_winsorize_bounds(X_train_m, X_test_m, w_bounds)
             X_train_i = add_interaction_features(X_train_w)
             X_test_i = add_interaction_features(X_test_w)
-            _apply_zscore_from_stats([X_train_i, X_test_i], sector_stats)
+            if sector_stats:
+                apply_zscore_from_stats([X_train_i, X_test_i], sector_stats)
             X_train_enc, X_test_enc = encode_and_align(X_train_i, X_test_i, feature_columns)
 
         else:
             # ── Cache MISS: full training pipeline ───────────────────────────
-            X_train_w, X_test_w, w_bounds = winsorize_features(X_train, X_test)
+            # 1. Impute (train medians) → 2. Winsorize → 3. Interactions →
+            # 4. Sector z-scores → 5. Encode/align → 6. Feature selection.
+            medians = fit_imputation(X_train)
+            X_train_m = apply_imputation(X_train, medians)
+            X_test_m = apply_imputation(X_test, medians)
+
+            X_train_w, X_test_w, w_bounds = winsorize_features(X_train_m, X_test_m)
             X_train_i = add_interaction_features(X_train_w)
             X_test_i = add_interaction_features(X_test_w)
 
             sector_stats = {}
             if "Sector" in X_train_i.columns:
-                sector_stats = _compute_sector_stats(X_train_i)
-                _apply_zscore_from_stats([X_train_i, X_test_i], sector_stats)
+                sector_stats = compute_sector_stats(X_train_i)
+                apply_zscore_from_stats([X_train_i, X_test_i], sector_stats)
 
             X_train_enc, X_test_enc = encode_and_align(X_train_i, X_test_i)
-            feature_columns = X_train_enc.columns.tolist()
+
+            # Feature selection: prune near-zero-variance + redundant columns.
+            selected_features = fit_feature_selection(X_train_enc)
+            X_train_enc = X_train_enc[selected_features]
+            X_test_enc = X_test_enc.reindex(columns=selected_features, fill_value=0)
+            feature_columns = selected_features
 
             best_xgb, calibrated_model = train_model(X_train_enc, y_train)
 
-            # Threshold optimisation
+            # Threshold optimisation (values learned on training data only)
             y_train_proba = calibrated_model.predict_proba(X_train_enc)
             optimal_thresholds = _optimize_thresholds(y_train, y_train_proba, len(LABEL_ENCODER.classes_))
 
-            proba_test = calibrated_model.predict_proba(X_test_enc)
-            f1_standard = f1_score(y_test, calibrated_model.predict(X_test_enc), average="macro")
-            f1_threshold = f1_score(y_test, (proba_test * optimal_thresholds).argmax(axis=1), average="macro")
+            # Strategy selector decided on TRAINING data only (no test-set peek).
+            # Previously this compared macro-F1 on y_test, which leaked test labels
+            # into the choice of whether to apply thresholds (documented in §4.6)
+            # and optimistically inflated reported metrics.
+            f1_standard = f1_score(y_train, calibrated_model.predict(X_train_enc), average="macro")
+            f1_threshold = f1_score(y_train, (y_train_proba * optimal_thresholds).argmax(axis=1), average="macro")
             use_thresholds = f1_threshold > f1_standard
 
             # Persist cache
             joblib.dump(calibrated_model, paths["calibrated_model"])
             joblib.dump(best_xgb, paths["base_model"])
+            joblib.dump(medians, paths["imputer_medians"])
             joblib.dump(w_bounds, paths["winsorize_bounds"])
             joblib.dump(sector_stats, paths["sector_stats"])
             joblib.dump(feature_columns, paths["feature_columns"])
@@ -596,12 +390,14 @@ def main():
             "actual": LABEL_ENCODER.inverse_transform(y_test),
             "predicted": LABEL_ENCODER.inverse_transform(pred_indices),
         }).to_csv(RESULTS_DIR / f"xgboost_test_predictions{suffix}.csv", index=False)
-        
+
         pd.DataFrame(
             classification_report(y_test, pred_indices, target_names=LABEL_ENCODER.classes_, output_dict=True)
         ).transpose().to_csv(RESULTS_DIR / f"xgboost_classification_report{suffix}.csv")
-        
+
         with open(RESULTS_DIR / f"xgboost_metrics{suffix}.txt", "w") as f:
+            f.write(f"split_strategy: {split_strategy}\n")
+            f.write(f"test_samples: {len(y_test)}\n")
             f.write(f"accuracy: {acc:.4f}\n")
             f.write(f"f1_macro: {f1_score(y_test, pred_indices, average='macro'):.4f}\n")
 
@@ -627,7 +423,7 @@ def main():
                     "precision": f"{precision:.4f}",
                     "recall": f"{recall:.4f}",
                     "f1": f"{f1:.4f}",
-                    "strength": "3-model soft-voting ensemble; isotonic-calibrated + threshold-optimized; 11 new credit-risk features; aggressive regularization.",
+                    "strength": "3-model soft-voting ensemble; isotonic-calibrated + threshold-optimized; company-level leakage-safe split; imputation + feature selection.",
                     "weakness": "May overfit if the dataset is too small or highly imbalanced.",
                 },
                 "matrix": cm.tolist(),

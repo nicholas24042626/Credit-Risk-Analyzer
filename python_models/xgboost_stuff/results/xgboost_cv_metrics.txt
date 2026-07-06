@@ -1,0 +1,11 @@
+cv_folds: 5
+split: grouped_stratified (company-level, leakage-safe)
+prediction: standard calibrated (no threshold strategy selector)
+accuracy_mean: 0.4603
+accuracy_std: 0.0313
+macro_f1_mean: 0.4181
+macro_f1_std: 0.0308
+f1_Investment_High_mean: 0.5546
+f1_Investment_Low_mean: 0.3642
+f1_Speculative_mean: 0.4997
+f1_Distressed_mean: 0.2537
