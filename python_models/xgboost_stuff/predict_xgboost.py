@@ -51,7 +51,7 @@ from preprocessing import (
 warnings.filterwarnings("ignore")
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
-DEFAULT_DATASET_PATH = Path(__file__).resolve().parents[2] / "set A corporate_rating.csv"
+DEFAULT_DATASET_PATH = Path(__file__).resolve().parents[2] / "data" / "set A corporate_rating.csv"
 
 
 # ---------------------------------------------------------------------------

@@ -56,8 +56,8 @@ def humanize_feature_name(name):
 
 
 def load_default_dataframe():
-    project_root = Path(__file__).resolve().parents[1]
-    default_path = project_root / "set A corporate_rating.csv"
+    project_root = Path(__file__).resolve().parents[2]
+    default_path = project_root / "data" / "set A corporate_rating.csv"
     if default_path.exists():
         return pd.read_csv(default_path)
     raise FileNotFoundError("Default dataset was not found at the notebook's CSV path.")
