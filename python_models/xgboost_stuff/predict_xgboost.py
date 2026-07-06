@@ -19,6 +19,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import VotingClassifier
 from sklearn.metrics import (
     accuracy_score,
+    classification_report,
     confusion_matrix,
     f1_score,
     precision_recall_fscore_support,
@@ -588,6 +589,21 @@ def main():
             y_test, pred_indices, average="weighted", zero_division=0
         )
         cm = confusion_matrix(y_test, pred_indices, labels=[0, 1, 2, 3])
+
+        # ── Save evaluation metrics ──────────────────────────────────────────
+        suffix = "" if data_hash == "default" else f"_{data_hash}"
+        pd.DataFrame({
+            "actual": LABEL_ENCODER.inverse_transform(y_test),
+            "predicted": LABEL_ENCODER.inverse_transform(pred_indices),
+        }).to_csv(RESULTS_DIR / f"xgboost_test_predictions{suffix}.csv", index=False)
+        
+        pd.DataFrame(
+            classification_report(y_test, pred_indices, target_names=LABEL_ENCODER.classes_, output_dict=True)
+        ).transpose().to_csv(RESULTS_DIR / f"xgboost_classification_report{suffix}.csv")
+        
+        with open(RESULTS_DIR / f"xgboost_metrics{suffix}.txt", "w") as f:
+            f.write(f"accuracy: {acc:.4f}\n")
+            f.write(f"f1_macro: {f1_score(y_test, pred_indices, average='macro'):.4f}\n")
 
         # ── SHAP ─────────────────────────────────────────────────────────────
         first_pred_class_idx = int(pred_indices[0])

@@ -371,18 +371,18 @@ The confusion matrix reveals the model's misclassification patterns across the f
 ```
                   Predicted
                   IH    IL    SP    DI
-Actual IH     [  75    20     4     0 ]
-       IL     [  22    82    30     0 ]
-       SP     [   7    29   137     0 ]
-       DI     [   0     0     1     0 ]
+Actual IH     [  81   16     2     0 ]
+       IL     [  30   86    18     0 ]
+       SP     [   6   40   126     0 ]
+       DI     [   0    0     1     0 ]
 ```
 
 *(IH = Investment-High, IL = Investment-Low, SP = Speculative, DI = Distressed)*
 
 ### 7.1 Misclassification Patterns
 
-- **Investment-High ↔ Investment-Low** boundary is the primary confusion zone (20 IH→IL, 22 IL→IH). These adjacent classes share overlapping financial profiles.
-- **Investment-Low ↔ Speculative** boundary is the second major source of error (30 IL→SP, 29 SP→IL), reflecting the inherent difficulty of the BBB/BB boundary — the "fallen angel" threshold in credit risk.
+- **Investment-High ↔ Investment-Low** boundary is the primary confusion zone (16 IH→IL, 30 IL→IH). These adjacent classes share overlapping financial profiles.
+- **Investment-Low ↔ Speculative** boundary is the second major source of error (18 IL→SP, 40 SP→IL), reflecting the inherent difficulty of the BBB/BB boundary — the "fallen angel" threshold in credit risk.
 - **Distressed** class (0/1 correct) is unmeasurable at n=1. No supervised model can learn or be meaningfully evaluated on a single sample; this is a data-availability constraint, not a model architecture issue (see §13.2).
 - The model rarely makes **extreme misclassifications** (e.g., IH→DI or DI→IH = 0), indicating that the learned feature space preserves ordinal credit quality structure.
 
@@ -392,13 +392,13 @@ In banking applications, not all misclassifications carry equal cost. Under a ty
 
 | Misclassification Type | Cost Weight | Frequency | Weighted Cost |
 |---|---|---|---|
-| Upgrade by 1 tier | 2× | 51 | 102 |
-| Upgrade by 2+ tiers | 5× | 7 | 35 |
-| Downgrade by 1 tier | 1× | 49 | 49 |
-| Downgrade by 2+ tiers | 2× | 1 | 2 |
-| **Total Weighted Cost** | | | **188** |
-| **Maximum Possible Cost** | | | **~1,360** |
-| **Cost Efficiency** | | | **~86.18%** |
+| Upgrade by 1 tier | 2× | 71 | 142 |
+| Upgrade by 2+ tiers | 5× | 6 | 30 |
+| Downgrade by 1 tier | 1× | 34 | 34 |
+| Downgrade by 2+ tiers | 2× | 2 | 4 |
+| **Total Weighted Cost** | | | **210** |
+| **Maximum Possible Cost** | | | **~1,357** |
+| **Cost Efficiency** | | | **~84.52%** |
 
 ---
 
