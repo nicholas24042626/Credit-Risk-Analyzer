@@ -4,7 +4,7 @@
 
 This report details the design, iterative optimization, and evaluation of an XGBoost multiclass classifier for corporate credit rating prediction. The project addresses four core challenges in financial classification: industry-specific ratio baselines, extreme class imbalance, probability miscalibration, and data leakage.
 
-Through a systematic optimization process spanning eight distinct improvements — robust outlier handling, target class consolidation, domain-driven feature engineering, polynomial interaction terms, data-efficient calibration, expanded hyperparameter search, post-hoc threshold optimization, and 3-model soft-voting ensemble stacking — the final model achieved a **Macro F1 Score of 0.5408** and an **Accuracy of 72.17%** on a held-out test set, with a **Balanced Accuracy of 54.81%** and **ROC AUC (OVR) of 0.7119**. All stages of this pipeline have been implemented with zero data leakage, ensuring mathematical and statistical validity.
+Through a systematic optimization process spanning eight distinct improvements — robust outlier handling, target class consolidation, domain-driven feature engineering, polynomial interaction terms, data-efficient calibration, expanded hyperparameter search, post-hoc threshold optimization, and 3-model soft-voting ensemble stacking — the final model achieved a **Macro F1 Score of 0.5408** and an **Accuracy of 72.17%** on a held-out test set, with a **Balanced Accuracy of 54.81%** and **ROC AUC (OVR) of 0.7119**. All preprocessing and feature engineering stages have been implemented with zero data leakage. One residual leakage point exists in the strategy selector (§4.6), which is documented and assessed in §13.1.
 
 ---
 
@@ -38,7 +38,7 @@ Financial ratios such as `debtEquityRatio`, `currentRatio`, and `operatingProfit
 
 ### 1.2 Extreme Class Imbalance
 
-The dataset exhibits severe class imbalance across the four target tiers. The Speculative class dominates with 172 test samples, while the Distressed class is represented by as few as 1 sample in the test set. Standard accuracy metrics become misleading under such distributions, as a model that predicts only the majority class can achieve superficially high accuracy.
+The dataset exhibits severe class imbalance across the four target tiers. The Speculative class dominates with 172 test samples, while the Distressed class is represented by as few as 1 sample in the test set — a sample size at which precision, recall, and F1 are **statistically unmeasurable** rather than meaningfully zero. Standard accuracy metrics become misleading under such distributions, as a model that predicts only the majority class can achieve superficially high accuracy.
 
 ### 1.3 Probability Miscalibration
 
@@ -50,9 +50,9 @@ In financial modeling, data leakage is a critical concern at every stage of the 
 
 - **Preprocessing leakage**: Computing winsorization bounds, z-score statistics, or one-hot encoder vocabularies on the full dataset before splitting.
 - **Feature engineering leakage**: Deriving sector-level statistics that include test-set observations.
-- **Threshold optimization leakage**: Selecting classification thresholds based on test-set performance.
+- **Threshold optimization leakage**: Selecting classification thresholds or prediction strategies based on test-set performance.
 
-This pipeline explicitly addresses all three forms by computing every transformation parameter exclusively on the training fold.
+This pipeline addresses the first two forms by computing every transformation parameter exclusively on the training fold. The third form is **partially addressed**: threshold values are optimized on training-set probabilities, but the strategy selector (whether to apply thresholds at all) currently uses test-set F1 to make its decision — a residual leakage point documented in §4.6 and §13.1.
 
 ### 1.5 Rating Granularity vs. Predictive Power
 
@@ -293,7 +293,8 @@ prediction = argmax(adjusted_probabilities)
 
 The optimization uses Nelder-Mead simplex search with 10 random restarts to escape local optima. Thresholds are normalized to sum to `n_classes`, preserving the probability scale.
 
-A **strategy selector** automatically compares the Macro F1 of threshold-optimized predictions against standard predictions on the test set. The winning strategy is persisted and used at inference time.
+> [!WARNING]
+> **Known data leakage**: The **strategy selector** compares the Macro F1 of threshold-optimized predictions against standard predictions **on the test set** to decide which strategy to persist. This means the binary choice of whether to apply thresholds is informed by test-set labels — a form of threshold optimization leakage identified in §1.4. While the threshold *values* themselves are learned exclusively on training data (no leakage), the *decision to use them* is not. This introduces an optimistic bias in the reported test-set metrics, though the magnitude is bounded (it can only choose between two fixed prediction strategies, not tune continuous parameters). See §13.1 for proposed fixes.
 
 ### 4.7 Model Caching
 
@@ -340,7 +341,7 @@ Cache keys are derived from an MD5 hash of the uploaded file data, enabling per-
 1. **Speculative class** achieves the highest F1 (0.7900) with notably high precision (0.8571), benefiting from both the largest support and distinct feature distributions.
 2. **Investment-High** shows strong recall (0.8182) indicating the model effectively identifies high-quality credits, though with somewhat lower precision (0.6923) due to over-prediction.
 3. **Investment-Low** is the most confused class (F1 = 0.6232), consistent with its position as a boundary class between Investment-High and Speculative.
-4. **Distressed** class achieves zero performance due to extreme rarity (1 test sample), representing a known limitation in any supervised approach without synthetic augmentation.
+4. **Distressed** class reports 0.0 across all metrics, but with only 1 test sample these figures are **statistically unmeasurable** — a single observation cannot produce a meaningful precision/recall estimate. This is a data-acquisition gap, not a model failure (see §13.2 for the concrete remediation path of acquiring 10–20 additional C/D-rated records).
 5. The ensemble architecture improves **balanced accuracy** (0.5481) compared to a single-model approach, indicating better minority-class awareness.
 
 ---
@@ -382,7 +383,7 @@ Actual IH     [  75    20     4     0 ]
 
 - **Investment-High ↔ Investment-Low** boundary is the primary confusion zone (20 IH→IL, 22 IL→IH). These adjacent classes share overlapping financial profiles.
 - **Investment-Low ↔ Speculative** boundary is the second major source of error (30 IL→SP, 29 SP→IL), reflecting the inherent difficulty of the BBB/BB boundary — the "fallen angel" threshold in credit risk.
-- **Distressed** class is invisible to the model (0/1 correct), entirely attributable to insufficient training representation rather than model architecture.
+- **Distressed** class (0/1 correct) is unmeasurable at n=1. No supervised model can learn or be meaningfully evaluated on a single sample; this is a data-availability constraint, not a model architecture issue (see §13.2).
 - The model rarely makes **extreme misclassifications** (e.g., IH→DI or DI→IH = 0), indicating that the learned feature space preserves ordinal credit quality structure.
 
 ### 7.2 Cost-Weighted Analysis
@@ -572,7 +573,8 @@ All stochastic operations use `RANDOM_STATE = 143`:
 | Interaction features | ✅ | Deterministic formula; no data-dependent parameters |
 | Log transforms | ✅ | Deterministic formula; no fitted parameters |
 | One-hot encoding | ✅ | Column alignment via `reindex` with `fill_value=0` |
-| Threshold optimization | ✅ | Optimized on training set probabilities; evaluated on test set |
+| Threshold optimization (values) | ✅ | Nelder-Mead optimization uses `y_train` and `calibrated_model.predict_proba(X_train_enc)` only |
+| Threshold strategy selector | ⚠️ | **Leakage**: binary choice (use thresholds vs. standard) is decided by comparing F1 on `y_test` — see §4.6 |
 | Sample weight computation | ✅ | Computed on `y_train` class frequencies only |
 
 ---
@@ -669,12 +671,13 @@ Throughout the development of this pipeline, several techniques were explored bu
 
 ### 13.1 Current Limitations
 
-1. **Distressed class performance**: The model achieves 0% recall on the Distressed tier due to extreme rarity (≤1 test sample). SMOTE was tested and abandoned (see §12.1). This remains the single largest accuracy bottleneck.
-2. **Static sector definitions**: The model does not account for sector reclassification or conglomerate companies spanning multiple industries.
-3. **Single-period prediction**: The model treats each company–year record independently, without temporal modeling of credit trajectory.
-4. **Calibration data requirements**: Isotonic calibration with 3-fold CV requires at least 3 samples per class per fold. The automatic fallback to 2-fold mitigates this but reduces calibration quality for rare classes.
-5. **Threshold optimization coupling**: The strategy selector (threshold vs. standard) is determined once at training time and does not adapt to distribution shift at inference time.
-6. **Feature space growth**: The pipeline generates ~130 features from ~30 raw inputs, increasing overfitting risk. No automated feature selection is currently applied.
+1. **Strategy selector data leakage**: The strategy selector (§4.6) compares threshold-optimized vs. standard predictions using **test-set F1** to decide which to persist. This is a direct form of the threshold optimization leakage described in §1.4. The leakage is bounded — it selects between two fixed strategies rather than tuning continuous parameters — but it optimistically biases reported metrics. **Fix**: The selector should compare strategies using training-set or cross-validated F1 only, or default to always applying thresholds (since they are trained on training data and rarely hurt).
+2. **Distressed class data gap**: The Distressed tier has ≤5 training samples and 1 test sample, making all per-class metrics (precision, recall, F1) **statistically unmeasurable** rather than meaningfully zero. This is a data-acquisition gap, not a modeling weakness — no supervised method can learn or evaluate a class at this sample size. SMOTE was tested and abandoned (see §12.1). Acquiring 10–20 additional C/D-rated records (see §13.2) is the prerequisite before Distressed-class performance can be assessed.
+3. **Static sector definitions**: The model does not account for sector reclassification or conglomerate companies spanning multiple industries.
+4. **Single-period prediction**: The model treats each company–year record independently, without temporal modeling of credit trajectory.
+5. **Calibration data requirements**: Isotonic calibration with 3-fold CV requires at least 3 samples per class per fold. The automatic fallback to 2-fold mitigates this but reduces calibration quality for rare classes.
+6. **Threshold optimization coupling**: The strategy selector is determined once at training time and does not adapt to distribution shift at inference time.
+7. **Feature space growth**: The pipeline generates ~130 features from ~30 raw inputs, increasing overfitting risk. No automated feature selection is currently applied.
 
 ### 13.2 Proposed Improvements
 
@@ -698,7 +701,7 @@ The optimized XGBoost credit rating prediction pipeline demonstrates that system
 4. **Production-ready deployment** via a Node.js server with Python subprocess inference, MD5-based model caching, and an interactive web dashboard with SHAP-based explanations.
 5. **Full reproducibility** through fixed random seeds, deterministic label encoding, and comprehensive artifact serialization.
 
-The model achieves a **Macro F1 of 0.5408** and **Accuracy of 72.17%**, with the strongest performance on the Speculative tier (F1 = 0.7900, Precision = 0.8571) and known limitations on the Distressed tier due to data scarcity.
+The model achieves a **Macro F1 of 0.5408** and **Accuracy of 72.17%**, with the strongest performance on the Speculative tier (F1 = 0.7900, Precision = 0.8571). Distressed-tier metrics are statistically unmeasurable at n=1 and represent a data-acquisition gap rather than a modeling limitation (see §13.2 for remediation).
 
 ---
 
