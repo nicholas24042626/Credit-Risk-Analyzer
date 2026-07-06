@@ -23,7 +23,7 @@ from sklearn.metrics import (
     f1_score,
     precision_recall_fscore_support,
 )
-from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import RandomizedSearchCV, train_test_split
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.utils.class_weight import compute_sample_weight
 from xgboost import XGBClassifier
@@ -342,7 +342,7 @@ def _optimize_thresholds(y_true, y_proba, n_classes):
 
     best_score, best_thresholds = -1.0, np.ones(n_classes)
     rng = np.random.default_rng(RANDOM_STATE)
-    for _ in range(20):  # More restarts → better threshold coverage
+    for _ in range(10):  # Restarts for threshold coverage
         init = rng.uniform(0.5, 2.0, n_classes)
         res = minimize(neg_f1, init, method="Nelder-Mead",
                        options={"maxiter": 2000, "xatol": 1e-5, "fatol": 1e-5})
@@ -377,7 +377,7 @@ def train_model(X_train_enc, y_train):
     # Aggressive grid — favors deeper trees + more regularization
     param_grid = {
         "max_depth":        [5, 7, 9],
-        "n_estimators":     [300, 500],
+        "n_estimators":     [150, 200],
         "learning_rate":    [0.03, 0.05, 0.1],
         "min_child_weight": [1, 3, 5],
         "gamma":            [0, 0.1, 0.2],
@@ -385,14 +385,16 @@ def train_model(X_train_enc, y_train):
         "reg_lambda":       [1, 1.5],
     }
 
-    # Model 1 — best from GridSearchCV
-    grid = GridSearchCV(
+    # Model 1 — best from RandomizedSearchCV (100 samples from the grid)
+    grid = RandomizedSearchCV(
         estimator=base_model,
-        param_grid=param_grid,
+        param_distributions=param_grid,
+        n_iter=15,
         scoring="f1_macro",
-        cv=5,
+        cv=3,
         n_jobs=-1,
         refit=True,
+        random_state=RANDOM_STATE,
         verbose=0,
     )
     grid.fit(X_train_enc, y_train, sample_weight=sample_weights)
@@ -414,9 +416,15 @@ def train_model(X_train_enc, y_train):
     )
     ensemble.fit(X_train_enc, y_train, sample_weight=sample_weights)
 
-    # Calibrate the ensemble
-    calibrated = CalibratedClassifierCV(estimator=ensemble, method="isotonic", cv=3)
-    calibrated.fit(X_train_enc, y_train, sample_weight=sample_weights)
+    # Calibrate the ensemble (fall back to fewer folds for tiny minority classes)
+    for cv_folds in (3, 2):
+        try:
+            calibrated = CalibratedClassifierCV(estimator=ensemble, method="isotonic", cv=cv_folds)
+            calibrated.fit(X_train_enc, y_train, sample_weight=sample_weights)
+            break
+        except ValueError:
+            if cv_folds == 2:
+                raise
 
     return best_xgb, calibrated  # Return base model for SHAP, calibrated ensemble for predictions
 

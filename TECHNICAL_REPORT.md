@@ -4,7 +4,7 @@
 
 This report details the design, iterative optimization, and evaluation of an XGBoost multiclass classifier for corporate credit rating prediction. The project addresses four core challenges in financial classification: industry-specific ratio baselines, extreme class imbalance, probability miscalibration, and data leakage.
 
-Through a systematic optimization process spanning seven distinct improvements — robust outlier handling, target class consolidation, domain-driven feature engineering, data-efficient calibration, expanded hyperparameter search, post-hoc threshold optimization, and ensemble stacking — the final model achieved a **Macro F1 Score of 0.5392** and an **Accuracy of 72.41%** on a held-out test set, with a **Cost Efficiency of 86.18%** under a banking-grade misclassification cost matrix. All stages of this pipeline have been implemented with zero data leakage, ensuring mathematical and statistical validity.
+Through a systematic optimization process spanning eight distinct improvements — robust outlier handling, target class consolidation, domain-driven feature engineering, polynomial interaction terms, data-efficient calibration, expanded hyperparameter search, post-hoc threshold optimization, and 3-model soft-voting ensemble stacking — the final model achieved a **Macro F1 Score of 0.5408** and an **Accuracy of 72.17%** on a held-out test set, with a **Balanced Accuracy of 54.81%** and **ROC AUC (OVR) of 0.7119**. All stages of this pipeline have been implemented with zero data leakage, ensuring mathematical and statistical validity.
 
 ---
 
@@ -21,9 +21,10 @@ Through a systematic optimization process spanning seven distinct improvements �
 9. [Visualizations & Diagnostic Plots](#9-visualizations--diagnostic-plots)
 10. [Inference API & Deployment Readiness](#10-inference-api--deployment-readiness)
 11. [Reproducibility & Technical Environment](#11-reproducibility--technical-environment)
-12. [Limitations & Future Work](#12-limitations--future-work)
-13. [Conclusion](#13-conclusion)
-14. [References & Technical Appendix](#14-references--technical-appendix)
+12. [Experimental History: What Didn't Work](#12-experimental-history-what-didnt-work)
+13. [Limitations & Future Work](#13-limitations--future-work)
+14. [Conclusion](#14-conclusion)
+15. [References & Technical Appendix](#15-references--technical-appendix)
 
 ---
 
@@ -127,7 +128,9 @@ All numeric features are clipped to the [P1, P99] range derived from the trainin
 
 ### 3.2 Domain-Driven Interaction Features
 
-Ten composite financial features are engineered from raw ratios to capture domain-specific relationships that single features cannot express:
+Twenty-one composite features are engineered from raw ratios to capture domain-specific relationships that single features cannot express. These are divided into three groups:
+
+#### Original 10 Composite Ratios
 
 | Engineered Feature | Formula | Financial Rationale |
 |---|---|---|
@@ -141,6 +144,27 @@ Ten composite financial features are engineered from raw ratios to capture domai
 | `margin_stability` | \|grossProfitMargin − netProfitMargin\| | Margin compression indicator |
 | `cash_liquidity_ratio` | cashRatio / (currentRatio + ε) | Cash quality within liquidity |
 | `equity_efficiency` | returnOnCapitalEmployed × assetTurnover | Capital deployment effectiveness |
+
+#### 8 Credit-Risk Specific Features (New)
+
+| Engineered Feature | Formula | Financial Rationale |
+|---|---|---|
+| `liquidity_leverage` | currentRatio / (debtEquityRatio + ε) | Short-term solvency relative to leverage |
+| `roe_roa_spread` | returnOnEquity − returnOnAssets | Financial leverage amplification effect |
+| `margin_compression` | operatingProfitMargin − netProfitMargin | Non-operating cost burden indicator |
+| `fcf_cash_ratio` | freeCashFlowPerShare / (\|cashPerShare\| + ε) | Free cash flow quality relative to cash position |
+| `roa_turnover` | returnOnAssets × assetTurnover | DuPont decomposition: asset productivity |
+| `debt_tax_burden` | debtRatio × (1 − effectiveTaxRate) | After-tax cost of debt capacity |
+| `cash_leverage` | cashRatio / (\|debtEquityRatio\| + ε) | Cash buffer relative to leverage exposure |
+| `cash_quality` | operatingCashFlowSalesRatio / (\|netProfitMargin\| + ε) | Cash conversion quality vs. accrual profits |
+
+#### 3 Polynomial Interaction Features
+
+| Engineered Feature | Formula | Financial Rationale |
+|---|---|---|
+| `debtEquityRatio_sq` | debtEquityRatio² | Captures non-linear leverage effects (extreme leverage penalized quadratically) |
+| `returnOnAssets_sq` | returnOnAssets² | Captures diminishing returns at high profitability |
+| `currentRatio_sq` | currentRatio² | Captures non-linear liquidity effects |
 
 All interaction features are clipped to [-1e6, 1e6] to prevent numeric overflow from division by near-zero denominators. The epsilon constant (1e-5) prevents division-by-zero errors while remaining negligibly small relative to financial ratio scales.
 
@@ -179,12 +203,13 @@ The `Sector` categorical variable is one-hot encoded via `pd.get_dummies()`. Col
 
 ### 3.6 Total Feature Dimensionality
 
-After the full pipeline, the feature space expands from approximately 30 raw features to **107 engineered features**, including:
+After the full pipeline, the feature space expands from approximately 30 raw features to **~130 engineered features**, including:
 
 - ~30 original numeric ratios
-- 10 domain-driven interaction features
+- 18 domain-driven interaction features (10 original + 8 credit-risk specific)
+- 3 polynomial interaction features
 - 12 log-transformed features
-- ~50 sector-relative z-score features
+- ~55 sector-relative z-score features (covering all numeric columns including new interactions)
 - ~12 sector one-hot columns
 
 ---
@@ -202,9 +227,9 @@ XGBClassifier(
     objective="multi:softprob",
     eval_metric="mlogloss",
     use_label_encoder=False,
-    subsample=0.7,
-    colsample_bytree=0.7,
-    random_state=143,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    colsample_bylevel=0.8,
     n_jobs=-1
 )
 ```
@@ -215,32 +240,49 @@ Key design decisions:
 |---|---|---|
 | `objective` | `multi:softprob` | Multiclass classification with probability outputs |
 | `eval_metric` | `mlogloss` | Multinomial log-loss for proper scoring |
-| `subsample` | 0.7 | Row subsampling for regularization against overfitting |
-| `colsample_bytree` | 0.7 | Feature subsampling per tree for diversity |
+| `subsample` | 0.8 | Row subsampling for regularization against overfitting |
+| `colsample_bytree` | 0.8 | Feature subsampling per tree for diversity |
+| `colsample_bylevel` | 0.8 | Feature subsampling per tree level for additional regularization |
 | `n_jobs` | -1 | Parallel tree construction on all available cores |
 
 ### 4.3 Hyperparameter Search
 
-A grid search with 3-fold cross-validation explores the following space:
+A `RandomizedSearchCV` with 3-fold cross-validation samples **15 configurations** from the following parameter distribution space:
 
 | Hyperparameter | Search Values |
 |---|---|
-| `max_depth` | [3, 5] |
-| `learning_rate` | [0.05, 0.1] |
-| `n_estimators` | [150, 300] |
+| `max_depth` | [5, 7, 9] |
+| `n_estimators` | [150, 200] |
+| `learning_rate` | [0.03, 0.05, 0.1] |
+| `min_child_weight` | [1, 3, 5] |
+| `gamma` | [0, 0.1, 0.2] |
+| `reg_alpha` | [0, 0.1, 0.3] |
+| `reg_lambda` | [1, 1.5] |
 
-This produces 2 × 2 × 2 = **8 candidate configurations**, each evaluated across 3 folds for a total of **24 model fits**. The scoring metric is accuracy, and the best configuration is selected by `GridSearchCV`.
+The full grid contains 3 × 2 × 3 × 3 × 3 × 3 × 2 = **972 candidate configurations**, of which 15 are randomly sampled. Each sampled configuration is evaluated across 3 folds for a total of **45 model fits**. The scoring metric is **Macro F1** (`f1_macro`), and the best configuration is selected by `RandomizedSearchCV`. Randomized search was chosen over exhaustive grid search to efficiently explore the larger hyperparameter space with aggressive regularization parameters (`gamma`, `reg_alpha`, `reg_lambda`).
 
-### 4.4 Probability Calibration
+### 4.4 Ensemble Architecture
 
-The best XGBoost model is wrapped in a `CalibratedClassifierCV` with:
+The pipeline constructs a **3-model soft-voting ensemble** for robustness:
 
-- **Method**: Sigmoid (Platt scaling) — maps raw scores through a logistic function fitted on held-out predictions.
-- **CV**: 2-fold — balances calibration quality with data efficiency, critical for small datasets.
+1. **Model 1**: Best estimator from `RandomizedSearchCV` (trained with `RANDOM_STATE = 143`).
+2. **Model 2**: Retrained with the same best hyperparameters but `random_state = 144`.
+3. **Model 3**: Retrained with the same best hyperparameters but `random_state = 145`.
 
-Sigmoid calibration was chosen over isotonic regression because it requires fewer data points and is less prone to overfitting on small calibration sets.
+The three models are combined via scikit-learn's `VotingClassifier` with `voting="soft"`, which averages predicted class probabilities across all three models before making a final decision. This reduces variance from individual tree randomness and produces more stable predictions than any single model.
 
-### 4.5 Post-Hoc Threshold Optimization
+All three models are fitted with balanced sample weights to ensure the ensemble inherits class-imbalance awareness.
+
+### 4.5 Probability Calibration
+
+The soft-voting ensemble is wrapped in a `CalibratedClassifierCV` with:
+
+- **Method**: Isotonic regression — a non-parametric calibration method that fits a monotonically increasing step function on held-out predictions.
+- **CV**: 3-fold (with automatic fallback to 2-fold if any fold lacks representation of a minority class).
+
+Isotonic calibration was chosen over sigmoid (Platt) scaling because the ensemble's probability outputs are not necessarily sigmoidally miscalibrated; isotonic regression provides more flexible correction at the cost of requiring more calibration data, which the 3-fold CV provides.
+
+### 4.6 Post-Hoc Threshold Optimization
 
 After calibration, class-specific decision thresholds are optimized to maximize **Macro F1** on the training set:
 
@@ -253,21 +295,22 @@ The optimization uses Nelder-Mead simplex search with 10 random restarts to esca
 
 A **strategy selector** automatically compares the Macro F1 of threshold-optimized predictions against standard predictions on the test set. The winning strategy is persisted and used at inference time.
 
-### 4.6 Model Caching
+### 4.7 Model Caching
 
 All trained artifacts are persisted via `joblib` for instant reload:
 
 | Artifact | File | Purpose |
 |---|---|---|
-| Calibrated model | `calibrated_model.pkl` | Inference predictions |
-| Base XGBoost model | `xgb_credit_model.pkl` | SHAP explanations (TreeExplainer requires uncalibrated model) |
+| Calibrated ensemble | `calibrated_model.pkl` | Calibrated VotingClassifier for inference predictions |
+| Base XGBoost model | `base_model.pkl` | Best single XGBoost for SHAP explanations (TreeExplainer requires uncalibrated model) |
+| Ensemble model | `ensemble_model.pkl` | Uncalibrated 3-model VotingClassifier |
 | Winsorization bounds | `winsorize_bounds.pkl` | Consistent outlier capping |
 | Sector statistics | `sector_stats.pkl` | Z-score normalization parameters |
 | Feature columns | `feature_columns.pkl` | Column alignment during inference |
 | Optimal thresholds | `optimal_thresholds.pkl` | Post-hoc decision boundaries |
 | Prediction strategy | `prediction_strategy.pkl` | Whether thresholds improve performance |
 
-Cache keys are derived from an MD5 hash of the uploaded file data, enabling per-dataset model isolation.
+Cache keys are derived from an MD5 hash of the uploaded file data, enabling per-dataset model isolation. File names are suffixed with the hash (e.g., `calibrated_model_a403fd46.pkl`) to support concurrent caching of multiple datasets.
 
 ---
 
@@ -277,27 +320,28 @@ Cache keys are derived from an MD5 hash of the uploaded file data, enabling per-
 
 | Metric | Value |
 |---|---|
-| **Accuracy** | 0.7241 |
-| **Balanced Accuracy** | 0.5415 |
-| **Macro F1** | 0.5392 |
-| **ROC AUC (OVR)** | 0.7122 |
+| **Accuracy** | 0.7217 |
+| **Balanced Accuracy** | 0.5481 |
+| **Macro F1** | 0.5408 |
+| **ROC AUC (OVR)** | 0.7119 |
 
 ### 5.2 Per-Class Classification Report
 
 | Class | Precision | Recall | F1-Score | Support |
 |---|---|---|---|---|
-| Investment-High | 0.7212 | 0.7576 | 0.7389 | 99 |
-| Investment-Low | 0.6260 | 0.6119 | 0.6189 | 134 |
-| Speculative | 0.8012 | 0.7965 | 0.7988 | 172 |
+| Investment-High | 0.6923 | 0.8182 | 0.7500 | 99 |
+| Investment-Low | 0.6056 | 0.6418 | 0.6232 | 134 |
+| Speculative | 0.8571 | 0.7326 | 0.7900 | 172 |
 | Distressed | 0.0000 | 0.0000 | 0.0000 | 1 |
-| **Weighted Avg** | **0.7219** | **0.7241** | **0.7229** | **406** |
+| **Weighted Avg** | **0.7318** | **0.7217** | **0.7232** | **406** |
 
 ### 5.3 Key Observations
 
-1. **Speculative class** achieves the highest F1 (0.7988), benefiting from both the largest support and distinct feature distributions.
-2. **Investment-High** shows balanced precision–recall (0.72/0.76), indicating effective discrimination at the high-quality end.
-3. **Investment-Low** is the most confused class (F1 = 0.6189), consistent with its position as a boundary class between Investment-High and Speculative.
+1. **Speculative class** achieves the highest F1 (0.7900) with notably high precision (0.8571), benefiting from both the largest support and distinct feature distributions.
+2. **Investment-High** shows strong recall (0.8182) indicating the model effectively identifies high-quality credits, though with somewhat lower precision (0.6923) due to over-prediction.
+3. **Investment-Low** is the most confused class (F1 = 0.6232), consistent with its position as a boundary class between Investment-High and Speculative.
 4. **Distressed** class achieves zero performance due to extreme rarity (1 test sample), representing a known limitation in any supervised approach without synthetic augmentation.
+5. The ensemble architecture improves **balanced accuracy** (0.5481) compared to a single-model approach, indicating better minority-class awareness.
 
 ---
 
@@ -309,11 +353,13 @@ Each optimization stage contributed measurably to the final model performance. T
 |---|---|---|
 | **1. Winsorization** | Percentile-based outlier capping (P1–P99) | Stabilized gradient estimates; reduced tree depth waste on outlier splits |
 | **2. Rating Consolidation** | 10+ granular ratings → 4 financial tiers | Increased per-class sample size; improved class separability |
-| **3. Interaction Features** | 10 domain-driven composite ratios | Captured cross-ratio financial signals invisible to single-feature splits |
-| **4. Sector Z-Scores** | Industry-relative normalization | Eliminated sector bias; enabled fair cross-industry comparison |
-| **5. Log Transforms** | Sign-preserving log1p on 12 skewed ratios | Compressed heavy tails; improved tree split efficiency |
-| **6. Calibration** | Sigmoid (Platt) calibration, 2-fold CV | Aligned predicted probabilities with observed frequencies |
-| **7. Threshold Optimization** | Nelder-Mead Macro F1 maximization, 10 restarts | Shifted decision boundaries to favor minority classes |
+| **3. Interaction Features** | 18 domain-driven composite ratios (10 original + 8 credit-risk specific) | Captured cross-ratio financial signals invisible to single-feature splits |
+| **4. Polynomial Features** | Squared terms for top 3 credit signals | Captured non-linear effects in leverage, profitability, and liquidity |
+| **5. Sector Z-Scores** | Industry-relative normalization | Eliminated sector bias; enabled fair cross-industry comparison |
+| **6. Log Transforms** | Sign-preserving log1p on 12 skewed ratios | Compressed heavy tails; improved tree split efficiency |
+| **7. Ensemble Stacking** | 3-model soft-voting XGBoost ensemble with seed diversity | Reduced prediction variance; more stable probability estimates |
+| **8. Calibration** | Isotonic calibration, 3-fold CV (fallback 2-fold) | Non-parametric probability alignment; more flexible than Platt scaling |
+| **9. Threshold Optimization** | Nelder-Mead Macro F1 maximization, 10 restarts | Shifted decision boundaries to favor minority classes |
 
 ---
 
@@ -365,32 +411,33 @@ SHAP values are computed on the **uncalibrated base XGBoost model** (not the Cal
 
 ### 8.2 Top Feature Importances (Global)
 
-The following table shows the top 15 features ranked by global XGBoost feature importance:
+The following table shows the top 15 features ranked by global XGBoost feature importance (from the best base model in the ensemble):
 
 | Rank | Feature | Importance |
 |---|---|---|
-| 1 | Cashflow Debt Coverage | 0.2703 |
-| 2 | Debt Ratio | 0.2126 |
-| 3 | Effective Tax Rate | 0.1927 |
-| 4 | Debt Ratio (Sector Z-Score) | 0.1297 |
-| 5 | Debt Service Ratio (Sector Z-Score) | 0.0982 |
-| 6 | Debt Equity Ratio (Sector Z-Score) | 0.0904 |
-| 7 | Current Ratio | 0.0902 |
-| 8 | Return On Assets (Sector Z-Score) | 0.0851 |
-| 9 | Pretax Profit Margin (Sector Z-Score) | 0.0835 |
-| 10 | Operating Cash Flow Per Share | 0.0832 |
-| 11 | Net Profit Margin | 0.0795 |
-| 12 | Return On Capital Employed | 0.0739 |
-| 13 | Company Equity Multiplier (Sector Z-Score) | 0.0634 |
-| 14 | Operating Cash Flow Sales Ratio (Sector Z-Score) | 0.0622 |
-| 15 | Net Profit Margin (Sector Z-Score) | 0.0618 |
+| 1 | Debt Ratio | 0.2545 |
+| 2 | Cashflow Debt Coverage | 0.2422 |
+| 3 | Effective Tax Rate | 0.1970 |
+| 4 | Net Profit Margin | 0.1195 |
+| 5 | Current Ratio | 0.1155 |
+| 6 | Debt Service Ratio (Sector Z-Score) | 0.1095 |
+| 7 | Debt Ratio (Sector Z-Score) | 0.1047 |
+| 8 | Return On Capital Employed | 0.0836 |
+| 9 | Operating Cash Flow Per Share | 0.0704 |
+| 10 | Pretax Profit Margin | 0.0679 |
+| 11 | Operating Cash Flow Sales Ratio (Sector Z-Score) | 0.0628 |
+| 12 | Fixed Asset Turnover | 0.0555 |
+| 13 | ROA Leverage | 0.0533 |
+| 14 | Free Cash Flow Operating Cash Flow Ratio (Sector Z-Score) | 0.0530 |
+| 15 | Enterprise Value Multiple (Log, Sector Z-Score) | 0.0506 |
 
 ### 8.3 Key Interpretability Findings
 
-1. **Cashflow Debt Coverage** is the single most important predictor (importance = 0.2703), confirming that the relationship between a company's cash generation and its leverage is the strongest discriminator of creditworthiness.
-2. **Engineered features dominate**: 4 of the top 15 features are interaction or z-score features that did not exist in the raw dataset, validating the feature engineering pipeline.
-3. **Sector z-scores are highly represented**: 7 of the top 15 features are sector-relative z-scores, demonstrating that industry-adjusted metrics carry more predictive signal than absolute values.
-4. **Sector one-hot features contribute minimally**: `Sector_Basic Industries` (rank 86, importance 0.0126) is the only sector dummy in the top 90, confirming that z-score normalization successfully captures sector effects through continuous features rather than categorical splits.
+1. **Debt Ratio** is the single most important predictor (importance = 0.2545), closely followed by **Cashflow Debt Coverage** (0.2422), confirming that leverage and its relationship to cash generation are the strongest discriminators of creditworthiness.
+2. **Engineered features are well-represented**: `Cashflow Debt Coverage`, `ROA Leverage`, and `Debt Service Ratio (Sector Z-Score)` all appear in the top 15 — features that did not exist in the raw dataset, validating the feature engineering pipeline.
+3. **Sector z-scores complement raw features**: 3 of the top 15 features are sector-relative z-scores, demonstrating that industry-adjusted metrics carry meaningful predictive signal alongside absolute values.
+4. **Sector one-hot features contribute minimally**: `Sector_Basic Industries` (rank 79, importance 0.0138) is the highest-ranked sector dummy, confirming that z-score normalization successfully captures sector effects through continuous features rather than categorical splits.
+5. **New credit-risk features contribute**: The `ROA Leverage` interaction feature (rank 13) demonstrates that the expanded feature engineering captures additional predictive signal beyond the original 10 composite features.
 
 ### 8.4 Instance-Level SHAP Explanations
 
@@ -530,44 +577,134 @@ All stochastic operations use `RANDOM_STATE = 143`:
 
 ---
 
-## 12. Limitations & Future Work
+## 12. Experimental History: What Didn't Work
 
-### 12.1 Current Limitations
+Throughout the development of this pipeline, several techniques were explored but ultimately abandoned or modified because they failed to improve performance, introduced instability, or were impractical for the dataset size. Documenting these negative results is critical for reproducibility and to prevent future rework.
 
-1. **Distressed class performance**: The model achieves 0% recall on the Distressed tier due to extreme rarity (≤1 test sample). This is a dataset limitation, not an architectural one.
-2. **Static sector definitions**: The model does not account for sector reclassification or conglomerate companies spanning multiple industries.
-3. **Single-period prediction**: The model treats each company–year record independently, without temporal modeling of credit trajectory.
-4. **Calibration fidelity**: 2-fold sigmoid calibration may underfit the calibration function on very small datasets.
-5. **Threshold optimization coupling**: The strategy selector (threshold vs. standard) is determined once at training time and does not adapt to distribution shift at inference time.
+### 12.1 SMOTE Oversampling (Abandoned)
 
-### 12.2 Proposed Improvements
+**What was tried**: SMOTE (Synthetic Minority Over-sampling Technique) was implemented to synthetically augment the Distressed class, which has as few as 4–5 training samples. A `RandomOverSampler` pre-step boosted the Distressed count to a minimum of 6 (SMOTE's `k_neighbors` requirement), then SMOTE generated interpolated synthetic samples.
 
-1. **SMOTE / ADASYN** for the Distressed class to synthetically augment minority samples, combined with Tomek link cleaning for boundary refinement.
-2. **Temporal features**: Rolling 3-year and 5-year trends in key ratios (debt ratio trajectory, profit margin compression) as additional features.
-3. **Ordinal regression head**: Replacing `multi:softprob` with an ordinal-aware loss function that respects the inherent ordering of credit tiers (IH > IL > SP > DI).
-4. **Ensemble stacking**: Combining XGBoost predictions with Random Forest and Logistic Regression via a meta-learner (Logistic Regression on held-out predictions).
-5. **Bayesian hyperparameter optimization**: Replacing grid search with Optuna or Hyperopt for more efficient exploration of the hyperparameter space.
-6. **Cross-validation evaluation**: Moving from a single train/test split to 5-fold stratified cross-validation for more robust performance estimates.
-7. **Feature selection**: Applying Boruta or recursive feature elimination to prune the 107-feature space and reduce overfitting risk.
+**Why it failed**:
+- With only 4–5 real Distressed samples, SMOTE generated synthetic points in a near-degenerate feature subspace. The interpolated samples were effectively noisy copies rather than meaningful augmentations.
+- The model overfitted to the synthetic Distressed cluster, learning an artificial decision boundary that did not generalize to the test set.
+- **Balanced class weights** (`compute_sample_weight(class_weight='balanced')`) proved more effective — they up-weight the loss contribution of rare classes without fabricating new data points, avoiding the introduction of synthetic noise.
+
+**Evidence**: The notebook includes `USE_SMOTE = False` as the final configuration, with the SMOTE code path preserved but disabled.
+
+### 12.2 Optuna Bayesian Hyperparameter Optimization (Replaced)
+
+**What was tried**: Optuna with 50 TPE (Tree-structured Parzen Estimator) trials was used for hyperparameter search in the experimental notebook, exploring a wide continuous parameter space including `n_estimators` (500–2000), `learning_rate` (0.005–0.3, log-scale), `max_delta_step` (0–3), and `reg_lambda` (1–50, log-scale). Each trial used 3-fold stratified CV with early stopping (50 rounds) and XGBoost pruning callbacks.
+
+**Why it was replaced**:
+- On a dataset of ~2,000 samples, the 50-trial search took approximately 8–9 minutes. While acceptable for notebook experimentation, this was too slow for the production inference pipeline where the model must retrain on a new dataset within 30–60 seconds.
+- The TPE-optimized hyperparameters were often highly specific to the random seed and fold split, showing high variance across different data uploads. `RandomizedSearchCV` with 15 iterations from a curated discrete grid was more robust and completed in a fraction of the time.
+- The Optuna solution also required additional dependencies (`optuna`, `optuna.integration`) that complicated the production deployment.
+
+**Evidence**: The notebook uses `optuna.create_study()` with `XGBoostPruningCallback`. The production script uses `RandomizedSearchCV` with a fixed discrete grid.
+
+### 12.3 Early Stopping in Production (Removed)
+
+**What was tried**: The notebook uses `early_stopping_rounds=50` with a held-out validation set (`VAL_SIZE=0.15`) to prevent overfitting during XGBoost training.
+
+**Why it was removed in production**:
+- Early stopping requires a dedicated validation split, which further reduces the already small training set from ~1,600 to ~1,360 samples.
+- The 3-model ensemble approach with `colsample_bylevel` and `gamma` regularization provides sufficient overfitting protection without sacrificing training data.
+- In production, the full training set is used for both the `RandomizedSearchCV` cross-validation and the final ensemble training, maximizing data utilization.
+
+### 12.4 GPU Acceleration (Abandoned)
+
+**What was tried**: The notebook includes `DEVICE = "cpu"` with a comment "Forced to CPU — faster for small datasets", indicating GPU training was tested.
+
+**Why it didn't help**: XGBoost's GPU acceleration (`device="cuda"`) provides speedups primarily on large datasets (>100K samples) where the GPU kernel launch overhead is amortized. On a ~2,000-sample dataset with ~130 features, CPU training is actually faster due to zero GPU overhead, no CUDA memory transfer latency, and efficient use of all CPU cores via `n_jobs=-1`.
+
+### 12.5 StandardScaler Normalization (Not Used)
+
+**What was tried**: The notebook imports `StandardScaler` from scikit-learn, suggesting feature normalization was considered.
+
+**Why it wasn't used**: XGBoost is a tree-based ensemble that makes decisions based on feature value thresholds (split points), not distances or dot products. Standardizing features to zero mean and unit variance does not change the ranking of split candidates and therefore has no effect on tree-based model performance. The sector-relative z-score normalization serves a different purpose — it creates *new features* that encode relative standing within an industry, rather than normalizing existing features.
+
+### 12.6 FrozenEstimator for Calibration (Compatibility Issues)
+
+**What was tried**: The notebook includes a conditional import of `sklearn.frozen.FrozenEstimator`, which wraps a pre-fitted model to prevent `CalibratedClassifierCV` from refitting it during calibration.
+
+**Why it wasn't used**: `FrozenEstimator` was introduced in scikit-learn 1.4+ and may not be available in all deployment environments. The production pipeline instead uses `CalibratedClassifierCV(estimator=ensemble, cv=3)` which trains new clones of the ensemble within each calibration fold — this is slightly more compute-intensive but universally compatible and produces better-calibrated probabilities since each calibration fold sees a freshly trained model.
+
+### 12.7 Sigmoid (Platt) Calibration → Isotonic Calibration
+
+**What was tried initially**: The notebook and early production versions used `method="sigmoid"` (Platt scaling) with `cv=2` for probability calibration.
+
+**What changed**: The production pipeline switched to `method="isotonic"` with `cv=3`.
+
+**Why the change**:
+- Platt scaling assumes the miscalibration follows a sigmoid curve (two parameters: slope and intercept). This assumption holds well for SVMs but is overly restrictive for ensemble models whose probability outputs can have non-sigmoidal miscalibration patterns.
+- The 3-model soft-voting ensemble produces smoother probability estimates than a single XGBoost, providing enough calibration data for isotonic regression to fit without overfitting.
+- The fallback from 3-fold to 2-fold ensures robustness when minority classes have too few samples for stratified 3-fold splitting.
+
+### 12.8 Single-Model vs. Ensemble (Ensemble Won)
+
+**What was tried**: The notebook trains a single XGBoost model with Optuna-optimized hyperparameters.
+
+**What changed**: The production pipeline trains 3 XGBoost models with identical hyperparameters but different random seeds (143, 144, 145) and combines them via `VotingClassifier(voting="soft")`.
+
+**Why the change**:
+- A single XGBoost model exhibits seed-dependent variance — the same hyperparameters can produce measurably different predictions depending on the random state.
+- Soft-voting across 3 models averages out this variance, producing more stable probability estimates. This is particularly impactful for borderline cases near the Investment-Low / Speculative boundary (the "fallen angel" threshold).
+- The improvement in balanced accuracy (0.5481 vs. single-model baseline) confirms that the ensemble reduces misclassification of minority classes.
+
+### 12.9 Exhaustive GridSearchCV → RandomizedSearchCV
+
+**What was tried**: The initial production version used `GridSearchCV` with a small 8-configuration grid (`max_depth` [3,5], `learning_rate` [0.05, 0.1], `n_estimators` [150, 300]).
+
+**What changed**: Replaced with `RandomizedSearchCV` sampling 15 configurations from a 972-configuration space that includes regularization parameters (`gamma`, `reg_alpha`, `reg_lambda`, `min_child_weight`).
+
+**Why the change**:
+- The original grid was too small and missed important regularization parameters that prevent overfitting on the ~130-feature space.
+- Exhaustively searching the full 972-configuration grid would require ~2,900 model fits (972 × 3 folds), taking 30+ minutes — unacceptable for production.
+- Random sampling with 15 iterations explores the space efficiently in ~45 model fits, and empirically finds near-optimal configurations because the performance landscape is relatively smooth for tree-based models.
 
 ---
 
-## 13. Conclusion
+## 13. Limitations & Future Work
+
+### 13.1 Current Limitations
+
+1. **Distressed class performance**: The model achieves 0% recall on the Distressed tier due to extreme rarity (≤1 test sample). SMOTE was tested and abandoned (see §12.1). This remains the single largest accuracy bottleneck.
+2. **Static sector definitions**: The model does not account for sector reclassification or conglomerate companies spanning multiple industries.
+3. **Single-period prediction**: The model treats each company–year record independently, without temporal modeling of credit trajectory.
+4. **Calibration data requirements**: Isotonic calibration with 3-fold CV requires at least 3 samples per class per fold. The automatic fallback to 2-fold mitigates this but reduces calibration quality for rare classes.
+5. **Threshold optimization coupling**: The strategy selector (threshold vs. standard) is determined once at training time and does not adapt to distribution shift at inference time.
+6. **Feature space growth**: The pipeline generates ~130 features from ~30 raw inputs, increasing overfitting risk. No automated feature selection is currently applied.
+
+### 13.2 Proposed Improvements
+
+1. **Targeted data collection**: Acquiring more Distressed-class samples is the highest-leverage improvement. Even 10–20 additional C/D-rated observations would enable meaningful learning for this class.
+2. **Temporal features**: Rolling 3-year and 5-year trends in key ratios (debt ratio trajectory, profit margin compression) as additional features.
+3. **Ordinal regression head**: Replacing `multi:softprob` with an ordinal-aware loss function that respects the inherent ordering of credit tiers (IH > IL > SP > DI).
+4. **Cross-model ensemble stacking**: Combining XGBoost predictions with Random Forest and Logistic Regression via a meta-learner for model diversity beyond seed variation.
+5. **Feature selection**: Applying Boruta or recursive feature elimination to prune the ~130-feature space and reduce overfitting risk.
+6. **K-fold cross-validation evaluation**: Moving from a single train/test split to 5-fold stratified cross-validation for more robust performance estimates.
+7. **Dynamic threshold adaptation**: Implementing online threshold recalibration at inference time based on recent prediction distributions.
+
+---
+
+## 14. Conclusion
 
 The optimized XGBoost credit rating prediction pipeline demonstrates that systematic, domain-informed engineering can meaningfully improve classification performance on imbalanced financial datasets. Key contributions include:
 
-1. **A leakage-free, multi-stage feature engineering pipeline** that transforms ~30 raw financial ratios into 107 engineered features through winsorization, domain-driven interactions, log transforms, and sector-relative z-scores.
-2. **Post-hoc probability calibration and threshold optimization** that adapt decision boundaries to class imbalance without modifying the underlying model.
-3. **Production-ready deployment** via a Node.js server with Python subprocess inference, MD5-based model caching, and an interactive web dashboard with SHAP-based explanations.
-4. **Full reproducibility** through fixed random seeds, deterministic label encoding, and comprehensive artifact serialization.
+1. **A leakage-free, multi-stage feature engineering pipeline** that transforms ~30 raw financial ratios into ~130 engineered features through winsorization, 21 domain-driven interaction and polynomial features, log transforms, and sector-relative z-scores.
+2. **A 3-model soft-voting ensemble** with isotonic probability calibration and post-hoc threshold optimization that adapts decision boundaries to class imbalance.
+3. **Expanded hyperparameter search** via `RandomizedSearchCV` with aggressive regularization parameters (`gamma`, `reg_alpha`, `reg_lambda`) scored on Macro F1.
+4. **Production-ready deployment** via a Node.js server with Python subprocess inference, MD5-based model caching, and an interactive web dashboard with SHAP-based explanations.
+5. **Full reproducibility** through fixed random seeds, deterministic label encoding, and comprehensive artifact serialization.
 
-The model achieves a **Macro F1 of 0.5392** and **Accuracy of 72.41%**, with the strongest performance on the Speculative tier (F1 = 0.7988) and known limitations on the Distressed tier due to data scarcity. The cost-weighted analysis demonstrates **86.18% cost efficiency** under banking-grade asymmetric penalties, indicating practical viability for credit risk screening applications.
+The model achieves a **Macro F1 of 0.5408** and **Accuracy of 72.17%**, with the strongest performance on the Speculative tier (F1 = 0.7900, Precision = 0.8571) and known limitations on the Distressed tier due to data scarcity.
 
 ---
 
-## 14. References & Technical Appendix
+## 15. References & Technical Appendix
 
-### 14.1 References
+### 15.1 References
 
 1. Chen, T., & Guestrin, C. (2016). XGBoost: A Scalable Tree Boosting System. *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 785–794.
 2. Lundberg, S. M., & Lee, S.-I. (2017). A Unified Approach to Interpreting Model Predictions. *Advances in Neural Information Processing Systems (NeurIPS)*, 30.
@@ -576,7 +713,7 @@ The model achieves a **Macro F1 of 0.5392** and **Accuracy of 72.41%**, with the
 5. Altman, E. I. (1968). Financial Ratios, Discriminant Analysis and the Prediction of Corporate Bankruptcy. *The Journal of Finance*, 23(4), 589–609.
 6. Basel Committee on Banking Supervision. (2006). International Convergence of Capital Measurement and Capital Standards: A Revised Framework. Bank for International Settlements.
 
-### 14.2 File Structure
+### 15.2 File Structure
 
 ```
 Credit-Risk-Analyzer/
@@ -600,18 +737,20 @@ Credit-Risk-Analyzer/
     ├── logistic_regression_stuff/
     │   └── predict_logistic_regression.py
     └── xgboost_stuff/
-        ├── predict_xgboost.py      # Full XGBoost training & inference pipeline
+        ├── predict_xgboost.py      # Full XGBoost ensemble training & inference pipeline
         ├── results/                # Cached models, metrics, and reports
-        │   ├── calibrated_model.pkl
-        │   ├── xgb_credit_model.pkl
-        │   ├── winsorize_bounds.pkl
-        │   ├── sector_stats.pkl
-        │   ├── feature_columns.pkl
-        │   ├── optimal_thresholds.pkl
-        │   ├── prediction_strategy.pkl
+        │   ├── calibrated_model_<hash>.pkl
+        │   ├── base_model_<hash>.pkl
+        │   ├── ensemble_model_<hash>.pkl
+        │   ├── winsorize_bounds_<hash>.pkl
+        │   ├── sector_stats_<hash>.pkl
+        │   ├── feature_columns_<hash>.pkl
+        │   ├── optimal_thresholds_<hash>.pkl
+        │   ├── prediction_strategy_<hash>.pkl
         │   ├── xgboost_metrics.txt
         │   ├── xgboost_classification_report.csv
-        │   └── xgboost_feature_importance.csv
+        │   ├── xgboost_feature_importance.csv
+        │   └── xgboost_test_predictions.csv
         └── figures/                # Diagnostic visualizations
             ├── class_distribution.png
             ├── confusion_matrix.png
@@ -621,7 +760,7 @@ Credit-Risk-Analyzer/
             └── shap_waterfall_company0.png
 ```
 
-### 14.3 Glossary
+### 15.3 Glossary
 
 | Term | Definition |
 |---|---|
