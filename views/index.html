@@ -429,18 +429,41 @@
 
     .select-wrap { margin-top: 14px; display: grid; gap: 10px; }
 
-    select {
-      width: 100%;
-      border-radius: 14px;
-      border: 1px solid rgba(57,96,139,0.18);
-      background: rgba(255,255,255,0.86);
-      color: var(--text);
-      padding: 13px 14px;
-      font-size: 0.98rem;
-      outline: none;
+    .model-btn-group {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 14px;
     }
 
-    select option { background: #ffffff; color: var(--text); }
+    .model-btn {
+      appearance: none;
+      border: 1.5px solid rgba(57, 96, 139, 0.2);
+      border-radius: 14px;
+      padding: 12px 10px;
+      font-size: 0.93rem;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.82);
+      color: var(--text);
+      transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease, border-color 120ms ease, color 120ms ease;
+      text-align: center;
+      line-height: 1.25;
+    }
+
+    .model-btn:hover {
+      transform: translateY(-1px);
+      border-color: var(--accent);
+      box-shadow: 0 6px 18px rgba(20, 200, 168, 0.14);
+    }
+
+    .model-btn.active {
+      background: linear-gradient(145deg, var(--accent), #56dff2);
+      border-color: transparent;
+      color: #ffffff;
+      box-shadow: 0 10px 24px rgba(20, 200, 168, 0.28);
+    }
 
     .ratio-form {
       display: grid;
@@ -818,12 +841,12 @@
                 </div>
                 <h4 style="margin: 0 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.88rem;">Model selector</h4>
                 <div class="select-wrap">
-                  <select id="modelSelect">
-                    <option>Decision Tree</option>
-                    <option>Random Forest</option>
-                    <option>Logistic Regression</option>
-                    <option>XGBoost</option>
-                  </select>
+                  <div class="model-btn-group" id="modelBtnGroup" role="group" aria-label="Select a model">
+                    <button class="model-btn active" type="button" data-model="Decision Tree">Decision Tree</button>
+                    <button class="model-btn" type="button" data-model="Random Forest">Random Forest</button>
+                    <button class="model-btn" type="button" data-model="Logistic Regression">Logistic Regression</button>
+                    <button class="model-btn" type="button" data-model="XGBoost">XGBoost</button>
+                  </div>
                   <button class="button" id="analyzeBtn" type="button">Run analysis</button>
                 </div>
                 <p class="panel-copy" style="margin-top: 14px;">

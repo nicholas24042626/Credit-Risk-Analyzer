@@ -5,7 +5,7 @@ const { spawn } = require("node:child_process");
 
 const decisionTreeModel = require("./models/decisionTree");
 const randomForestModel = require("./models/randomForest");
-const xgboostModel = require("./models/xgboost"); // Import the XGBoost model configuration
+const xgboostModel = require("./models/xgboost");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 3000);
@@ -71,6 +71,19 @@ function runPythonModel(scriptRelativePath, requestPayload, res) {
   let stderrData = "";
   let hasResponded = false;
 
+  // Timeout handler for long-running models (5 minutes)
+  const timeout = setTimeout(() => {
+    if (hasResponded) {
+      return;
+    }
+    hasResponded = true;
+    pythonProcess.kill("SIGTERM");
+    sendJson(res, 504, {
+      error: "Model training timed out after 5 minutes.",
+      details: "Consider using a smaller dataset or pre-training the model offline."
+    });
+  }, 5 * 60 * 1000);
+
   pythonProcess.stdout.on("data", (data) => {
     stdoutData += data.toString();
   });
@@ -83,6 +96,7 @@ function runPythonModel(scriptRelativePath, requestPayload, res) {
     if (hasResponded) {
       return;
     }
+    clearTimeout(timeout);
     hasResponded = true;
     sendJson(res, 500, {
       error: "Failed to start Python process.",
@@ -94,6 +108,7 @@ function runPythonModel(scriptRelativePath, requestPayload, res) {
     if (hasResponded) {
       return;
     }
+    clearTimeout(timeout);
 
     if (code !== 0) {
       let stderrPayload = null;
@@ -147,13 +162,22 @@ function safeResolve(requestPath) {
   return resolved;
 }
 
+// Map every registered model route to its Python script path.
+const MODEL_ROUTES = new Map([
+  [decisionTreeModel.route, decisionTreeModel.scriptPath],
+  [randomForestModel.route, randomForestModel.scriptPath],
+  [xgboostModel.route,      xgboostModel.scriptPath],
+]);
+
 const server = http.createServer((req, res) => {
   if (!req.url) {
     send(res, 400, "Bad Request", "text/plain; charset=utf-8");
     return;
   }
 
-  if (req.method === "POST" && req.url === decisionTreeModel.route) {
+  // Generic handler for all registered Python model prediction endpoints.
+  const scriptPath = req.method === "POST" && MODEL_ROUTES.get(req.url);
+  if (scriptPath) {
     let body = "";
 
     req.on("data", (chunk) => {
@@ -173,62 +197,7 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      runPythonModel(decisionTreeModel.scriptPath, requestPayload, res);
-    });
-
-    return;
-  }
-
-  // Predict endpoint for the Python-trained Random Forest model.
-  if (req.method === "POST" && req.url === randomForestModel.route) {
-    let body = "";
-
-    req.on("data", (chunk) => {
-      body += chunk;
-    });
-
-    req.on("end", () => {
-      let requestPayload;
-
-      try {
-        requestPayload = body ? JSON.parse(body) : {};
-      } catch (err) {
-        sendJson(res, 400, {
-          error: "Invalid JSON request body.",
-          details: err.message
-        });
-        return;
-      }
-
-      // Keep the route path beside the Random Forest model configuration.
-      runPythonModel(randomForestModel.scriptPath, requestPayload, res);
-    });
-
-    return;
-  }
-
-  // Predict endpoint for the Python-trained XGBoost model.
-  if (req.method === "POST" && req.url === xgboostModel.route) {
-    let body = "";
-
-    req.on("data", (chunk) => {
-      body += chunk;
-    });
-
-    req.on("end", () => {
-      let requestPayload;
-
-      try {
-        requestPayload = body ? JSON.parse(body) : {};
-      } catch (err) {
-        sendJson(res, 400, {
-          error: "Invalid JSON request body.",
-          details: err.message
-        });
-        return;
-      }
-
-      runPythonModel(xgboostModel.scriptPath, requestPayload, res);
+      runPythonModel(scriptPath, requestPayload, res);
     });
 
     return;

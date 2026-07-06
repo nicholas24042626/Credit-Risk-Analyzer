@@ -37,7 +37,7 @@ function initApp() {
   const selectedFileName = document.getElementById("selectedFileName");
   const selectedFileMeta = document.getElementById("selectedFileMeta");
   const modelFileName = document.getElementById("modelFileName");
-  const modelSelect = document.getElementById("modelSelect");
+  const modelBtnGroup = document.getElementById("modelBtnGroup");
   const analyzeBtn = document.getElementById("analyzeBtn");
   const selectedModelTag = document.getElementById("selectedModelTag");
   const performanceStats = document.getElementById("performanceStats");
@@ -296,8 +296,20 @@ function initApp() {
     shapSummary.textContent = `SHAP explains which features pushed the company toward its predicted risk class for ${model}.`;
   }
 
+  // Returns the currently active model name from the button group.
+  function getSelectedModel() {
+    const active = modelBtnGroup.querySelector(".model-btn.active");
+    return active ? active.dataset.model : "Decision Tree";
+  }
+
+  // Activates the clicked model button and deactivates the rest.
+  function setActiveModelBtn(btn) {
+    modelBtnGroup.querySelectorAll(".model-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+  }
+
   function runAnalysis() {
-    appState.model = modelSelect.value;
+    appState.model = getSelectedModel();
     selectedModelTag.textContent = `Model: ${appState.model}`;
     renderMetrics(appState.model);
     renderMatrix(appState.model);
@@ -306,7 +318,8 @@ function initApp() {
   }
 
   function updateActionLabel() {
-    if (modelSelect.value === "Decision Tree" || modelSelect.value === "Random Forest" || modelSelect.value === "XGBoost") {
+    const model = getSelectedModel();
+    if (model === "Decision Tree" || model === "Random Forest" || model === "XGBoost") {
       analyzeBtn.textContent = "Train / Predict";
       ratioForm.style.display = "none";
     } else {
@@ -500,7 +513,7 @@ function initApp() {
     }
 
     analyzeBtn.disabled = true;
-    predictionResult.textContent = "Running XGBoost prediction on uploaded data…";
+    predictionResult.textContent = "Training XGBoost on uploaded data…";
     predictionResult.className = "prediction-result";
 
     try {
@@ -512,14 +525,14 @@ function initApp() {
       const result = await response.json();
 
       if (!response.ok) {
-        throw new Error(result.error || "XGBoost prediction failed.");
+        throw new Error(getBackendErrorMessage(result, "XGBoost prediction failed."));
       }
 
       if (result.modelData) {
         modelData["XGBoost"] = result.modelData;
       }
 
-      predictionResult.textContent = `Prediction: ${formatPredictionLabel(result.prediction || "Unknown")}`;
+      predictionResult.textContent = "Model trained and dataset evaluated successfully.";
       predictionResult.className = "prediction-result success";
       appState.model = "XGBoost";
       selectedModelTag.textContent = `Model: XGBoost · Prediction: ${formatPredictionLabel(result.prediction || "Unknown")}`;
@@ -566,15 +579,16 @@ function initApp() {
   });
 
   analyzeBtn.addEventListener("click", () => {
-    if (modelSelect.value === "Decision Tree") {
+    const model = getSelectedModel();
+    if (model === "Decision Tree") {
       predictDecisionTree();
       return;
     }
-    if (modelSelect.value === "Random Forest") {
+    if (model === "Random Forest") {
       predictRandomForest();
       return;
     }
-    if (modelSelect.value === "XGBoost") {
+    if (model === "XGBoost") {
       predictXgboost();
       return;
     }
@@ -582,7 +596,13 @@ function initApp() {
     runAnalysis();
   });
 
-  modelSelect.addEventListener("change", updateActionLabel);
+  // Update button label whenever a model button is clicked.
+  modelBtnGroup.addEventListener("click", (event) => {
+    const btn = event.target.closest(".model-btn");
+    if (!btn) return;
+    setActiveModelBtn(btn);
+    updateActionLabel();
+  });
 
   dropzone.addEventListener("dragover", (event) => {
     event.preventDefault();
