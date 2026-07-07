@@ -1,11 +1,21 @@
 cv_folds: 5
 split: grouped_stratified (company-level, leakage-safe)
 prediction: standard calibrated (no threshold strategy selector)
-accuracy_mean: 0.4618
-accuracy_std: 0.0329
-macro_f1_mean: 0.4151
-macro_f1_std: 0.0267
-f1_Investment_High_mean: 0.5521
-f1_Investment_Low_mean: 0.3749
-f1_Speculative_mean: 0.5042
-f1_Distressed_mean: 0.2292
+train_accuracy_mean: 0.5927
+train_accuracy_std: 0.0128
+test_accuracy_mean: 0.4514
+test_accuracy_std: 0.0253
+train_test_accuracy_gap: 0.1412
+train_macro_f1_mean: 0.5554
+test_macro_f1_mean: 0.4161
+train_test_macro_f1_gap: 0.1393
+accuracy_mean: 0.4514
+accuracy_std: 0.0253
+macro_f1_mean: 0.4161
+macro_f1_std: 0.0237
+
+MILD OVERFITTING SIGNAL: train/test accuracy gap is 0.1412. Some benefit possible from trimming features or adding regularization, but this is not the dominant issue.
+f1_Investment_High_mean: 0.5253
+f1_Investment_Low_mean: 0.4028
+f1_Speculative_mean: 0.4712
+f1_Distressed_mean: 0.2651

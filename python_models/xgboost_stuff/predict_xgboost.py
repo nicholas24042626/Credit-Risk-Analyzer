@@ -121,7 +121,7 @@ def _optimize_thresholds(y_true, y_proba, n_classes):
 
     best_score, best_thresholds = -1.0, np.ones(n_classes)
     rng = np.random.default_rng(RANDOM_STATE)
-    for _ in range(10):  # Restarts for threshold coverage
+    for _ in range(25):  # Restarts for threshold coverage
         init = rng.uniform(0.5, 2.0, n_classes)
         res = minimize(neg_f1, init, method="Nelder-Mead",
                        options={"maxiter": 2000, "xatol": 1e-5, "fatol": 1e-5})
@@ -137,7 +137,7 @@ def train_model(X_train_enc, y_train):
 
     Strategy:
     1. Expand hyperparameter grid to cover more of the search space
-    2. Train 3 XGBoost models with different random seeds
+    2. Train 5 XGBoost models with different random seeds
     3. Soft-vote ensemble for robustness
     4. Isotonic calibration on the ensemble
     """
@@ -147,31 +147,31 @@ def train_model(X_train_enc, y_train):
         objective="multi:softprob",
         eval_metric="mlogloss",
         use_label_encoder=False,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        colsample_bylevel=0.8,
         random_state=RANDOM_STATE,  # Model 1 seed — required for reproducibility
         n_jobs=-1,
     )
 
-    # Aggressive grid — favors deeper trees + more regularization
+    # features, deep/many trees + light regularization let the model
+    # memorize training-fold noise rather than learn generalizable ratio
+    # relationships. This grid caps depth and estimator count and raises the
+    # regularization floors to shrink that gap.
     param_grid = {
-        "max_depth":        [5, 7, 9],
-        "n_estimators":     [150, 200],
+        "max_depth":        [2, 3, 4],
+        "n_estimators":     [50, 75, 100],
         "learning_rate":    [0.03, 0.05, 0.1],
-        "min_child_weight": [1, 3, 5],
-        "gamma":            [0, 0.1, 0.2],
-        "reg_alpha":        [0, 0.1, 0.3],
-        "reg_lambda":       [1, 1.5],
+        "min_child_weight": [5, 10, 15],
+        "gamma":            [0.1, 0.3, 0.5],
+        "reg_alpha":        [0.3, 0.5, 1.0],
+        "reg_lambda":       [1.5, 2.0, 3.0],
     }
 
-    # Model 1 — best from RandomizedSearchCV (15 samples from the grid)
+    # Model 1 — best from RandomizedSearchCV (50 samples from the grid)
     grid = RandomizedSearchCV(
         estimator=base_model,
         param_distributions=param_grid,
-        n_iter=15,
+        n_iter=50,
         scoring="f1_macro",
-        cv=3,
+        cv=5,
         n_jobs=-1,
         refit=True,
         random_state=RANDOM_STATE,
@@ -180,17 +180,27 @@ def train_model(X_train_enc, y_train):
     grid.fit(X_train_enc, y_train, sample_weight=sample_weights)
     best_xgb = grid.best_estimator_
 
-    # Model 2 & 3 — retrain best config with different random seeds for diversity
+    # Models 2-5 — retrain best config with different random seeds for diversity
     best_params = grid.best_params_
     xgb_2 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 1, "n_jobs": -1})
     xgb_3 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 2, "n_jobs": -1})
+    xgb_4 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 3, "n_jobs": -1})
+    xgb_5 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 4, "n_jobs": -1})
 
     xgb_2.fit(X_train_enc, y_train, sample_weight=sample_weights)
     xgb_3.fit(X_train_enc, y_train, sample_weight=sample_weights)
+    xgb_4.fit(X_train_enc, y_train, sample_weight=sample_weights)
+    xgb_5.fit(X_train_enc, y_train, sample_weight=sample_weights)
 
     # Soft voting ensemble
     ensemble = VotingClassifier(
-        estimators=[("xgb1", best_xgb), ("xgb2", xgb_2), ("xgb3", xgb_3)],
+        estimators=[
+            ("xgb1", best_xgb), 
+            ("xgb2", xgb_2), 
+            ("xgb3", xgb_3),
+            ("xgb4", xgb_4),
+            ("xgb5", xgb_5)
+        ],
         voting="soft",
         n_jobs=-1,
     )
@@ -427,7 +437,7 @@ def main():
                     "precision": f"{precision:.4f}",
                     "recall": f"{recall:.4f}",
                     "f1": f"{f1:.4f}",
-                    "strength": "3-model soft-voting ensemble; isotonic-calibrated + threshold-optimized; company-level leakage-safe split; imputation + feature selection.",
+                    "strength": "5-model soft-voting ensemble; isotonic-calibrated + threshold-optimized; company-level leakage-safe split; imputation + feature selection.",
                     "weakness": "May overfit if the dataset is too small or highly imbalanced.",
                 },
                 "matrix": cm.tolist(),
