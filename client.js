@@ -7,6 +7,11 @@ const appState = {
 
 const modelData = window.MODEL_LIBRARY || {};
 
+// Canonical rating grouping — must stay in sync with group_rating() in
+// preprocessing.py (XGBoost), predict_decision_tree.py, and
+// predict_random_forest.py. CCC/CC are grouped with Distressed (not
+// Speculative) so the Distressed tier has enough support to be measurable;
+// see docs/TECHNICAL_REPORT.md §2.3 for the full justification.
 const ratingRuleEngine = {
   "AAA": "Investment-High",
   "AA": "Investment-High",
@@ -14,8 +19,8 @@ const ratingRuleEngine = {
   "BBB": "Investment-Low",
   "BB": "Speculative",
   "B": "Speculative",
-  "CCC": "Speculative",
-  "CC": "Speculative",
+  "CCC": "Distressed",
+  "CC": "Distressed",
   "C": "Distressed",
   "D": "Distressed"
 };
