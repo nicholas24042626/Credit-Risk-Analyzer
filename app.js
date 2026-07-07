@@ -6,6 +6,7 @@ const { spawn } = require("node:child_process");
 const decisionTreeModel = require("./models/decisionTree");
 const randomForestModel = require("./models/randomForest");
 const xgboostModel = require("./models/xgboost");
+const logisticRegressionModel = require("./models/logisticRegression");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 3000);
@@ -167,6 +168,7 @@ const MODEL_ROUTES = new Map([
   [decisionTreeModel.route, decisionTreeModel.scriptPath],
   [randomForestModel.route, randomForestModel.scriptPath],
   [xgboostModel.route,      xgboostModel.scriptPath],
+  [logisticRegressionModel.route, logisticRegressionModel.scriptPath]
 ]);
 
 const server = http.createServer((req, res) => {
