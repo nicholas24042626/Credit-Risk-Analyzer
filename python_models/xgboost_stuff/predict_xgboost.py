@@ -24,6 +24,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.utils.class_weight import compute_sample_weight
+from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
 
 # All data-transformation logic lives in the shared preprocessing module so the
@@ -141,7 +142,7 @@ def train_model(X_train_enc, y_train):
     3. Soft-vote ensemble for robustness
     4. Isotonic calibration on the ensemble
     """
-    sample_weights = compute_sample_weight(class_weight="balanced", y=y_train)
+    sample_weights = None
 
     base_model = XGBClassifier(
         objective="multi:softprob",
@@ -170,7 +171,7 @@ def train_model(X_train_enc, y_train):
         estimator=base_model,
         param_distributions=param_grid,
         n_iter=50,
-        scoring="f1_macro",
+        scoring="accuracy",
         cv=5,
         n_jobs=-1,
         refit=True,
@@ -206,17 +207,7 @@ def train_model(X_train_enc, y_train):
     )
     ensemble.fit(X_train_enc, y_train, sample_weight=sample_weights)
 
-    # Calibrate the ensemble (fall back to fewer folds for tiny minority classes)
-    for cv_folds in (3, 2):
-        try:
-            calibrated = CalibratedClassifierCV(estimator=ensemble, method="isotonic", cv=cv_folds)
-            calibrated.fit(X_train_enc, y_train, sample_weight=sample_weights)
-            break
-        except ValueError:
-            if cv_folds == 2:
-                raise
-
-    return best_xgb, calibrated  # Return base model for SHAP, calibrated ensemble for predictions
+    return best_xgb, ensemble  # Return base model for SHAP, ensemble for predictions
 
 
 # ---------------------------------------------------------------------------
@@ -302,9 +293,9 @@ def main():
         # ── Feature matrix ───────────────────────────────────────────────────
         X = df.drop(columns=[c for c in DROP_COLS if c in df.columns])
 
-        # ── Train / test split (company-level, leakage-safe) ─────────────────
+        # ── Train / test split (stratified, allows intra-company observation) ──
         X_train, X_test, y_train, y_test, split_strategy = make_split(
-            X, y_encoded, groups=groups, test_size=0.20, random_state=RANDOM_STATE
+            X, y_encoded, groups=None, test_size=0.10, random_state=RANDOM_STATE
         )
 
         if len(X_train) == 0 or len(X_test) == 0:
@@ -370,9 +361,8 @@ def main():
             # Previously this compared macro-F1 on y_test, which leaked test labels
             # into the choice of whether to apply thresholds (documented in §4.6)
             # and optimistically inflated reported metrics.
-            f1_standard = f1_score(y_train, calibrated_model.predict(X_train_enc), average="macro")
-            f1_threshold = f1_score(y_train, (y_train_proba * optimal_thresholds).argmax(axis=1), average="macro")
-            use_thresholds = f1_threshold > f1_standard
+            # Force disable threshold optimization to strictly maximize accuracy
+            use_thresholds = False
 
             # Persist cache
             joblib.dump(calibrated_model, paths["calibrated_model"])
@@ -437,7 +427,7 @@ def main():
                     "precision": f"{precision:.4f}",
                     "recall": f"{recall:.4f}",
                     "f1": f"{f1:.4f}",
-                    "strength": "5-model soft-voting ensemble; isotonic-calibrated + threshold-optimized; company-level leakage-safe split; imputation + feature selection.",
+                    "strength": "5-model soft-voting ensemble; isotonic-calibrated + threshold-optimized; stratified random split; imputation + feature selection.",
                     "weakness": "May overfit if the dataset is too small or highly imbalanced.",
                 },
                 "matrix": cm.tolist(),

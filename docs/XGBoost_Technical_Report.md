@@ -1536,3 +1536,4 @@ Credit-Risk-Analyzer/
 | **Nelder-Mead** | Derivative-free simplex optimisation algorithm used for threshold tuning |
 | **StratifiedGroupKFold** | Scikit-learn splitter that maintains class proportions while keeping all records of a group (company) in the same fold |
 | **Fallen Angel** | Industry term for a bond downgraded from investment grade (BBB) to speculative grade (BB); the boundary this model most struggles with |
+
