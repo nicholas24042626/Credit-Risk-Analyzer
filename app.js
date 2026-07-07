@@ -63,22 +63,14 @@ function runPythonModel(scriptRelativePath, requestPayload, res) {
     windowsHide: true
   });
 
-let stdoutData = "";
-let stderrData = "";
-let hasResponded = false;
-
-if (pythonProcess.stdin) {
-    pythonProcess.stdin.on("error", (err) => {
-      stderrData += `\nFailed to send request payload to Python: ${err.message}`;
-    });
-
-    try {
-      pythonProcess.stdin.write(body);
-      pythonProcess.stdin.end();
-    } catch (err) {
-      stderrData += `\nFailed to write request payload to Python: ${err.message}`;
-    }
+  if (pythonProcess.stdin) {
+    pythonProcess.stdin.write(body);
+    pythonProcess.stdin.end();
   }
+
+  let stdoutData = "";
+  let stderrData = "";
+  let hasResponded = false;
 
   // Timeout handler for long-running models (5 minutes)
   const timeout = setTimeout(() => {
