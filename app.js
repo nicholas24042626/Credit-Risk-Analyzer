@@ -63,9 +63,30 @@ function runPythonModel(scriptRelativePath, requestPayload, res) {
     windowsHide: true
   });
 
+  // Guard every stdio pipe. If the Python process failed to actually start
+  // (e.g. "python" isn't resolvable on PATH on this machine), any of these
+  // pipes can emit an 'error' event. Without a listener, that crashes the
+  // entire Node server with an unhandled 'error' event. The pythonProcess
+  // "error"/"close" handlers below already report the failure to the
+  // client, so these listeners just prevent the crash.
   if (pythonProcess.stdin) {
-    pythonProcess.stdin.write(body);
-    pythonProcess.stdin.end();
+    pythonProcess.stdin.on("error", () => {});
+  }
+  if (pythonProcess.stdout) {
+    pythonProcess.stdout.on("error", () => {});
+  }
+  if (pythonProcess.stderr) {
+    pythonProcess.stderr.on("error", () => {});
+  }
+
+  if (pythonProcess.stdin) {
+    try {
+      pythonProcess.stdin.write(body);
+      pythonProcess.stdin.end();
+    } catch (err) {
+      // Writing after the pipe is already broken; the "error"/"close"
+      // handlers below will still fire and report the failure.
+    }
   }
 
   let stdoutData = "";
