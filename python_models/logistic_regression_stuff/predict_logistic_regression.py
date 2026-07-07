@@ -1,5 +1,4 @@
 import base64
-import base64
 import io
 import json
 import os
@@ -13,12 +12,11 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
-from sklearn.tree import DecisionTreeClassifier
 
 warnings.filterwarnings("ignore")
 
@@ -119,9 +117,79 @@ def build_pipeline(X):
 
     model = Pipeline(steps=[
         ("preprocessor", preprocessor),
-        ("model", DecisionTreeClassifier(random_state=RANDOM_STATE))
+        ("model", LogisticRegression(
+            max_iter=3000,
+            class_weight="balanced",
+            random_state=RANDOM_STATE
+        ))
     ])
     return model
+
+
+def to_dense(matrix):
+    if hasattr(matrix, "toarray"):
+        return matrix.toarray()
+    return np.asarray(matrix)
+
+
+def coefficient_fallback_importance(lr_model, feature_names, class_index, sample_row):
+    """Local, coefficient-based explanation used when SHAP is unavailable.
+
+    Mirrors the SHAP local-explanation shape (feature / abs value / effect)
+    by multiplying each fitted coefficient by the corresponding value of the
+    sample being explained, which approximates each feature's contribution
+    to that sample's predicted-class log-odds.
+    """
+    coefs = lr_model.coef_
+    if coefs.shape[0] == 1:
+        # Binary classification: sklearn only stores one coefficient row,
+        # for the positive class. Flip the sign for the negative class.
+        coef_row = coefs[0] if class_index == 1 else -coefs[0]
+    else:
+        coef_row = coefs[class_index]
+
+    contributions = coef_row * sample_row
+
+    local_df = pd.DataFrame({
+        "Feature": feature_names,
+        "SHAP Value": contributions
+    })
+    local_df["Abs SHAP Value"] = local_df["SHAP Value"].abs()
+    local_df["Effect"] = np.where(
+        local_df["SHAP Value"] > 0,
+        "Pushes toward predicted class",
+        "Pushes away from predicted class"
+    )
+
+    top_local = local_df.sort_values("Abs SHAP Value", ascending=False).head(15)
+    shap_features = [
+        {
+            "feature": humanize_feature_name(row["Feature"]),
+            "value": float(row["Abs SHAP Value"]),
+            "effect": row["Effect"]
+        }
+        for _, row in top_local.iterrows()
+    ]
+
+    positive = (
+        local_df[local_df["SHAP Value"] > 0]
+        .sort_values("SHAP Value", ascending=False)
+        .head(3)["Feature"]
+        .tolist()
+    )
+    negative = (
+        local_df[local_df["SHAP Value"] < 0]
+        .sort_values("SHAP Value", ascending=True)
+        .head(3)["Feature"]
+        .tolist()
+    )
+
+    shap_story = {
+        "positive": [humanize_feature_name(name) for name in positive],
+        "negative": [humanize_feature_name(name) for name in negative]
+    }
+
+    return shap_features, shap_story
 
 
 def main():
@@ -171,11 +239,14 @@ def main():
     baseline_f1 = float(f1_score(y_test, baseline_pred, average="weighted"))
     baseline_report = classification_report(y_test, baseline_pred, output_dict=True)
 
+    # Small, fast grid limited to Logistic Regression's own hyperparameters.
+    # "saga" supports both l1 and l2 penalties for multiclass problems, so
+    # C, penalty and solver can all be tuned together in one grid.
     param_grid = {
-        "model__criterion": ["gini", "entropy"],
-        "model__max_depth": [3, 5, 8, 10],
-        "model__min_samples_leaf": [1, 5, 10],
-        "model__class_weight": [None, "balanced"]
+        "model__C": [0.01, 0.1, 1, 10],
+        "model__penalty": ["l2", "l1"],
+        "model__solver": ["saga"],
+        "model__class_weight": ["balanced"]
     }
 
     grid_search = GridSearchCV(
@@ -199,51 +270,60 @@ def main():
     recall = float(report["weighted avg"]["recall"])
     f1 = float(report["weighted avg"]["f1-score"])
 
-    strength = "Best at separating Investment-Low and Speculative classes in the tuned tree."
-    weakness = "Distressed is still the hardest class because the dataset is small and imbalanced."
+    strength = "Coefficients give a directly interpretable, linear read on how each ratio moves the predicted rating."
+    weakness = "Distressed is still the hardest class because the dataset is small and imbalanced, and a linear model can't capture non-linear ratio interactions."
     if f1 < 0.5:
-        strength = "The tuned tree still finds useful structure in the financial ratios."
-        weakness = "Class imbalance is reducing performance on the smallest class."
+        strength = "The tuned logistic model still finds a useful linear signal in the financial ratios."
+        weakness = "Class imbalance and non-linear relationships between ratios are limiting performance on the smallest classes."
 
-    selected_class = labels[0]
     sample_company = X_test.iloc[[0]].copy()
     predicted_class = best_model.predict(sample_company)[0]
 
-    shap_story = {
-        "positive": [],
-        "negative": []
-    }
+    preprocessor = best_model.named_steps["preprocessor"]
+    lr_model = best_model.named_steps["model"]
+
+    raw_feature_names = preprocessor.get_feature_names_out()
+    shap_feature_names = [
+        name.replace("num__", "").replace("cat__", "")
+        for name in raw_feature_names
+    ]
+
+    X_test_processed = to_dense(preprocessor.transform(X_test))
+    X_test_shap = pd.DataFrame(X_test_processed, columns=shap_feature_names, index=X_test.index)
+
+    class_index = labels.index(predicted_class)
+
+    shap_story = {"positive": [], "negative": []}
     shap_features = []
 
     try:
         import shap  # noqa: F401
 
-        preprocessor = best_model.named_steps["preprocessor"]
-        tree_model = best_model.named_steps["model"]
-        X_test_processed = preprocessor.transform(X_test)
-        if hasattr(X_test_processed, "toarray"):
-            X_test_processed = X_test_processed.toarray()
-        raw_feature_names = preprocessor.get_feature_names_out()
-        shap_feature_names = [
-            name.replace("num__", "").replace("cat__", "")
-            for name in raw_feature_names
-        ]
-        X_test_shap = pd.DataFrame(X_test_processed, columns=shap_feature_names, index=X_test.index)
+        X_train_processed = to_dense(preprocessor.transform(X_train))
+        background_size = min(100, X_train_processed.shape[0])
+        rng = np.random.RandomState(RANDOM_STATE)
+        background_idx = rng.choice(X_train_processed.shape[0], size=background_size, replace=False)
+        background = X_train_processed[background_idx]
 
-        explainer = shap.TreeExplainer(tree_model)
-        shap_values = explainer.shap_values(X_test_shap, check_additivity=False)
+        # LinearExplainer is the SHAP method built for linear models like
+        # Logistic Regression (TreeExplainer is only valid for tree models).
+        explainer = shap.LinearExplainer(lr_model, background)
+        shap_values = explainer.shap_values(X_test_shap)
 
-        def get_class_shap_values(all_shap_values, class_index):
+        def get_class_shap_values(all_shap_values, class_idx, n_classes):
             if isinstance(all_shap_values, list):
-                return all_shap_values[class_index]
+                return all_shap_values[class_idx]
 
             all_shap_values = np.array(all_shap_values)
             if all_shap_values.ndim == 3:
-                return all_shap_values[:, :, class_index]
+                return all_shap_values[:, :, class_idx]
+            # Binary logistic regression: LinearExplainer returns a single
+            # array of shap values for the positive class only.
+            if n_classes == 2 and class_idx == 0:
+                return -all_shap_values
             return all_shap_values
 
-        class_index = labels.index(predicted_class)
-        class_shap_values = get_class_shap_values(shap_values, class_index)
+        class_shap_values = get_class_shap_values(shap_values, class_index, len(labels))
 
         local_shap_df = pd.DataFrame({
             "Feature": shap_feature_names,
@@ -284,27 +364,10 @@ def main():
             "negative": [humanize_feature_name(name) for name in negative]
         }
     except Exception:
-        perm_result = permutation_importance(
-            best_model,
-            X_test,
-            y_test,
-            n_repeats=10,
-            random_state=RANDOM_STATE,
-            scoring="f1_weighted"
+        sample_row = X_test_shap.iloc[0].to_numpy()
+        shap_features, shap_story = coefficient_fallback_importance(
+            lr_model, shap_feature_names, class_index, sample_row
         )
-        perm_df = pd.DataFrame({
-            "Feature": X_test.columns,
-            "Importance": perm_result.importances_mean
-        }).sort_values(by="Importance", ascending=False).head(15)
-
-        shap_features = [
-            {
-                "feature": humanize_feature_name(row["Feature"]),
-                "value": float(abs(row["Importance"])),
-                "effect": "Pushes toward predicted class" if row["Importance"] >= 0 else "Pushes away from predicted class"
-            }
-            for _, row in perm_df.iterrows()
-        ]
 
     result = {
         "prediction": predicted_class,
@@ -351,7 +414,7 @@ def main():
             "story": shap_story
         },
         "modelData": {
-            "tag": "Decision Tree",
+            "tag": "Logistic Regression",
             "labels": labels,
             "metrics": {
                 "accuracy": f"{accuracy:.4f}",
