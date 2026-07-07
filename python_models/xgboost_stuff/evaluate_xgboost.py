@@ -33,6 +33,7 @@ from preprocessing import (
     add_interaction_features,
     apply_imputation,
     apply_zscore_from_stats,
+    clean_dataframe,
     compute_sector_stats,
     encode_and_align,
     extract_groups,
@@ -69,6 +70,7 @@ def main():
     n_splits = int(sys.argv[1]) if len(sys.argv) > 1 else 5
 
     df = pd.read_csv(DEFAULT_DATASET_PATH)
+    df, _clean_report = clean_dataframe(df)
     y_raw = df["Rating"].apply(group_rating)
     mask = y_raw != "Unknown"
     df = df[mask].copy()

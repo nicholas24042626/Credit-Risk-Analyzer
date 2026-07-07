@@ -61,6 +61,53 @@ DROP_COLS = frozenset(
 # Candidate identifier columns for company-level grouping, in priority order.
 GROUP_ID_CANDIDATES = ("Symbol", "Name")
 
+# Columns that are mathematically non-negative (ratios or counts of non-negative
+# quantities). A negative value in any of these is a data-entry error rather than
+# signal, so it is converted to NaN during cleaning and later filled by the
+# train-only median imputer. Margins, returns, cash-flow-per-share, the effective
+# tax rate, and the equity/leverage multipliers are deliberately EXCLUDED because
+# they can be legitimately negative (losses, tax benefits, negative equity).
+NON_NEGATIVE_COLS = frozenset({
+    "currentRatio", "quickRatio", "cashRatio", "cashPerShare",
+    "daysOfSalesOutstanding", "debtRatio",
+    "assetTurnover", "fixedAssetTurnover", "payablesTurnover",
+})
+
+# Columns that are known to be non-numeric identifiers/categoricals and must
+# never be coerced to numeric during cleaning.
+KNOWN_NON_NUMERIC_COLS = frozenset({
+    "Name", "Symbol", "Rating Agency Name", "Date", "Rating", "RatingClass", "Sector",
+})
+
+# Minimum fraction of non-null values in an *unknown* object column that must
+# parse as numbers before the whole column is coerced to numeric. Below this it
+# is treated as genuinely categorical and left untouched. Known feature columns
+# (below) are always coerced regardless of this ratio.
+NUMERIC_COERCE_MIN_PARSE_RATIO = 0.9
+
+# Financial-ratio feature columns of the corporate-rating schema. These are
+# numeric by definition, so they are coerced unconditionally during cleaning
+# even if an upload pollutes them with text tokens beyond the ratio threshold.
+KNOWN_NUMERIC_FEATURE_COLS = frozenset({
+    "currentRatio", "quickRatio", "cashRatio", "daysOfSalesOutstanding",
+    "netProfitMargin", "pretaxProfitMargin", "grossProfitMargin",
+    "operatingProfitMargin", "returnOnAssets", "returnOnCapitalEmployed",
+    "returnOnEquity", "assetTurnover", "fixedAssetTurnover", "debtEquityRatio",
+    "debtRatio", "effectiveTaxRate", "freeCashFlowOperatingCashFlowRatio",
+    "freeCashFlowPerShare", "cashPerShare", "companyEquityMultiplier",
+    "ebitPerRevenue", "enterpriseValueMultiple", "operatingCashFlowPerShare",
+    "operatingCashFlowSalesRatio", "payablesTurnover",
+})
+
+# Ordinal severity of raw letter grades (higher == worse credit quality). Used to
+# resolve conflicting multi-agency ratings by keeping the most conservative
+# (worst) grade for a given company-date. Unknown grades map to -1 so any known
+# grade in the same group wins.
+RATING_SEVERITY = {
+    "AAA": 0, "AA": 1, "A": 2, "BBB": 3, "BB": 4, "B": 5,
+    "CCC": 6, "CC": 7, "C": 8, "D": 9,
+}
+
 _LOG_CANDIDATES = frozenset([
     "currentRatio", "quickRatio", "cashRatio", "daysOfSalesOutstanding",
     "debtEquityRatio", "enterpriseValueMultiple", "operatingCashFlowPerShare",
@@ -135,6 +182,159 @@ def humanize_feature_name(name):
     base = re.sub(r"\s+", " ", base).strip().title()
     suffix = (" (Log)" if is_log else "") + (" (Sector Z-Score)" if is_sec else "")
     return f"{base}{suffix}"
+
+
+# ---------------------------------------------------------------------------
+# Data cleaning (deterministic, per-cell — safe to run before the split)
+# ---------------------------------------------------------------------------
+
+def _coerce_numeric_like(out, report):
+    """Coerce object columns that are 'mostly numeric' to numeric dtype.
+
+    Uploaded CSVs frequently encode missing or errored cells as text tokens such
+    as "N/A", "-", "" or "#DIV/0!". Pandas then reads the entire column as object
+    dtype, which silently bypasses every numeric transform downstream
+    (imputation, winsorization, z-scoring all select numeric dtypes only) — the
+    column would either be dropped or crash XGBoost. Coercing such columns turns
+    the garbage tokens into NaN so they are imputed normally. Genuinely
+    categorical columns (numeric-parse ratio below the threshold) are left as-is.
+    """
+    coerced = []
+    for col in out.columns:
+        if col in KNOWN_NON_NUMERIC_COLS or out[col].dtype != object:
+            continue
+        parsed = pd.to_numeric(out[col], errors="coerce")
+        non_null = int(out[col].notna().sum())
+        if non_null == 0:
+            continue
+        parse_ratio = parsed.notna().sum() / non_null
+        # Known ratio columns are numeric by definition; coerce them regardless of
+        # how much junk an upload introduced. Unknown columns must clear the ratio
+        # threshold so genuinely categorical columns are preserved.
+        if col in KNOWN_NUMERIC_FEATURE_COLS or parse_ratio >= NUMERIC_COERCE_MIN_PARSE_RATIO:
+            out[col] = parsed
+            coerced.append(col)
+    report["numeric_like_columns_coerced"] = coerced
+    return out
+
+
+def _resolve_rating_conflicts(out, report):
+    """Collapse conflicting / duplicate multi-agency ratings per company-date.
+
+    When the same entity on the same date carries more than one rating (e.g. two
+    agencies disagree, or the same rating appears twice), the rows share
+    identical features but may carry contradictory targets — training noise. We
+    keep a single row per ``(id, Date)`` group, choosing the most conservative
+    (worst) grade, which is the safe default for credit-risk screening.
+
+    Uses the label column but no test information or fitted statistics, so it is
+    a deterministic data-quality step and remains leakage-safe (analogous to the
+    pre-split exclusion of Unknown-rated rows). Skipped when an identifier or the
+    Date column is absent, since collapsing a company's entire history would be
+    wrong.
+    """
+    report["rating_conflict_groups"] = 0
+    report["rating_conflict_rows_dropped"] = 0
+
+    id_col = next((c for c in GROUP_ID_CANDIDATES if c in out.columns), None)
+    if id_col is None or "Date" not in out.columns or "Rating" not in out.columns:
+        return out
+
+    key = [id_col, "Date"]
+    group_size = out.groupby(key)["Rating"].transform("size")
+    if not (group_size > 1).any():
+        return out  # every company-date is already unique (the default dataset)
+
+    distinct = out.groupby(key)["Rating"].transform("nunique")
+    report["rating_conflict_groups"] = int(out.loc[distinct > 1, key].drop_duplicates().shape[0])
+
+    severity = out["Rating"].astype(str).str.strip().str.upper().map(RATING_SEVERITY).fillna(-1)
+    n_before = len(out)
+    out = (
+        out.assign(_sev=severity)
+        .sort_values("_sev", ascending=False, kind="stable")
+        .drop_duplicates(subset=key, keep="first")
+        .drop(columns="_sev")
+        .sort_index()
+        .reset_index(drop=True)
+    )
+    report["rating_conflict_rows_dropped"] = n_before - len(out)
+    return out
+
+
+def clean_dataframe(df):
+    """Deterministic data cleaning applied *before* the train/test split.
+
+    Every operation here is per-row or per-cell and uses NO aggregate statistics,
+    so performing it before the split introduces no leakage (unlike imputation,
+    winsorization, and z-scoring, which are fit on the training fold only). The
+    steps are ordered so that later steps see the cleaned output of earlier ones.
+
+      1. Coerce "mostly numeric" text columns to numeric (handles "N/A",
+         "#DIV/0!", "" etc. in uploaded files) -> garbage becomes NaN.
+      2. Drop exact duplicate rows.
+      3. Normalise the Sector column's surrounding whitespace so "Energy" and
+         "Energy " collapse to one category before one-hot encoding.
+      4. Resolve conflicting/duplicate multi-agency ratings: keep one worst-case
+         row per (company, Date).
+      5. Replace +/-inf with NaN.
+      6. Null impossible negatives in the mathematically non-negative columns.
+      7. Drop rows whose entire numeric feature vector is NaN (no signal).
+
+    On the default dataset steps 1, 2, 4 and 7 are no-ops (it is already clean on
+    those axes), so the cached artifacts and reported metrics are unaffected; the
+    steps exist to protect arbitrary user-uploaded datasets. Returns
+    ``(cleaned_df, report)`` where ``report`` is a dict of counts for auditing.
+    """
+    out = df.copy()
+    report = {}
+
+    # 1. Coerce numeric-like text columns
+    out = _coerce_numeric_like(out, report)
+
+    # 2. Exact duplicate rows
+    n_before = len(out)
+    out = out.drop_duplicates().reset_index(drop=True)
+    report["duplicate_rows_dropped"] = n_before - len(out)
+
+    # 3. Sector whitespace normalisation
+    if "Sector" in out.columns:
+        out["Sector"] = out["Sector"].astype(str).str.strip()
+
+    # 4. Conflicting / duplicate multi-agency ratings
+    out = _resolve_rating_conflicts(out, report)
+
+    # 5. Infinities -> NaN
+    numeric_cols = out.select_dtypes(include="number").columns
+    if len(numeric_cols):
+        inf_count = int(np.isinf(out[numeric_cols].to_numpy(dtype="float64", na_value=np.nan)).sum())
+        report["inf_values_nulled"] = inf_count
+        out[numeric_cols] = out[numeric_cols].replace([np.inf, -np.inf], np.nan)
+    else:
+        report["inf_values_nulled"] = 0
+
+    # 6. Impossible negatives -> NaN (defensive: coerce any column still object,
+    #    e.g. an unknown-schema non-negative column that dodged step 1).
+    neg_count = 0
+    for col in NON_NEGATIVE_COLS & set(out.columns):
+        if out[col].dtype == object:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+        mask = out[col] < 0
+        neg_count += int(mask.sum())
+        out.loc[mask, col] = np.nan
+    report["impossible_negatives_nulled"] = neg_count
+
+    # 7. Drop rows with an entirely empty numeric feature vector
+    numeric_cols = out.select_dtypes(include="number").columns
+    if len(numeric_cols):
+        all_nan = out[numeric_cols].isna().all(axis=1)
+        report["empty_feature_rows_dropped"] = int(all_nan.sum())
+        if all_nan.any():
+            out = out.loc[~all_nan].reset_index(drop=True)
+    else:
+        report["empty_feature_rows_dropped"] = 0
+
+    return out, report
 
 
 # ---------------------------------------------------------------------------

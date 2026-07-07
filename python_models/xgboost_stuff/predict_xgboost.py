@@ -36,6 +36,7 @@ from preprocessing import (
     apply_imputation,
     apply_winsorize_bounds,
     apply_zscore_from_stats,
+    clean_dataframe,
     compute_sector_stats,
     encode_and_align,
     extract_groups,
@@ -275,6 +276,9 @@ def main():
 
         if "Rating" not in df.columns:
             raise ValueError("The uploaded dataset must contain a 'Rating' column to train the model.")
+
+        # ── Data cleaning (deterministic, pre-split, leakage-safe) ───────────
+        df, _clean_report = clean_dataframe(df)
 
         # ── Label preparation ────────────────────────────────────────────────
         y_raw = df["Rating"].apply(group_rating)
