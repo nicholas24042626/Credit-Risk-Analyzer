@@ -168,7 +168,7 @@ const MODEL_ROUTES = new Map([
   [decisionTreeModel.route, decisionTreeModel.scriptPath],
   [randomForestModel.route, randomForestModel.scriptPath],
   [xgboostModel.route,      xgboostModel.scriptPath],
-  [logisticRegressionModel.route, logisticRegressionModel.scriptPath]
+  [logisticRegressionModel.route, logisticRegressionModel.scriptPath],
 ]);
 
 const server = http.createServer((req, res) => {
