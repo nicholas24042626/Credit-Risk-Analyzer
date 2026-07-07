@@ -574,6 +574,53 @@ function initApp() {
     }
   }
 
+  async function predictLogisticRegression() {
+    let payload;
+
+    try {
+      payload = await buildDecisionTreePayload();
+    } catch (error) {
+      predictionResult.textContent = error.message;
+      predictionResult.className = "prediction-result error";
+      return;
+    }
+
+    analyzeBtn.disabled = true;
+    predictionResult.textContent = "Training Logistic Regression on uploaded data...";
+    predictionResult.className = "prediction-result";
+
+    try {
+      const response = await fetch("/predict/logistic-regression", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(getBackendErrorMessage(result, "Logistic Regression prediction failed."));
+      }
+
+      if (result.modelData) {
+        modelData["Logistic Regression"] = result.modelData;
+      }
+
+      predictionResult.textContent = "Model trained and dataset evaluated successfully.";
+      predictionResult.className = "prediction-result success";
+      appState.model = "Logistic Regression";
+      selectedModelTag.textContent = `Model: Logistic Regression · Prediction: ${formatPredictionLabel(result.samplePrediction?.prediction || result.prediction || "Unknown")}`;
+      renderMetrics("Logistic Regression");
+      renderMatrix("Logistic Regression");
+      renderShap("Logistic Regression");
+      showScreen(resultsScreen);
+    } catch (error) {
+      predictionResult.textContent = error.message || "Unable to get a prediction.";
+      predictionResult.className = "prediction-result error";
+    } finally {
+      analyzeBtn.disabled = false;
+    }
+  }
+
   async function predictXgboost() {
     let payload;
 
@@ -621,56 +668,6 @@ function initApp() {
     }
   }
 
-  async function predictLogisticRegression() {
-    let payload;
-
-    try {
-      payload = await buildDecisionTreePayload();
-    } catch (error) {
-      predictionResult.textContent = error.message;
-      predictionResult.className = "prediction-result error";
-      return;
-    }
-
-    analyzeBtn.disabled = true;
-    predictionResult.textContent = "Training Logistic Regression on uploaded data...";
-    predictionResult.className = "prediction-result";
-
-    try {
-      const response = await fetch("/predict/logistic-regression", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(getBackendErrorMessage(result, "Logistic Regression prediction failed."));
-      }
-
-      if (result.modelData) {
-        modelData["Logistic Regression"] = result.modelData;
-      }
-
-      predictionResult.textContent = "Model trained and dataset evaluated successfully.";
-      predictionResult.className = "prediction-result success";
-
-      appState.model = "Logistic Regression";
-      selectedModelTag.textContent = `Model: Logistic Regression · Prediction: ${formatPredictionLabel(result.prediction || "Unknown")}`;
-
-      renderMetrics("Logistic Regression");
-      renderMatrix("Logistic Regression");
-      renderShap("Logistic Regression");
-      showScreen(resultsScreen);
-    } catch (error) {
-      predictionResult.textContent = error.message || "Unable to train Logistic Regression.";
-      predictionResult.className = "prediction-result error";
-    } finally {
-      analyzeBtn.disabled = false;
-    }
-  }
-  
   browseBtn.addEventListener("click", (event) => {
     event.stopPropagation();
   });
