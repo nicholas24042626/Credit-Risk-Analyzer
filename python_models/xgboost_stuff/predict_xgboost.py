@@ -22,8 +22,9 @@ from sklearn.metrics import (
     f1_score,
     precision_recall_fscore_support,
 )
-from sklearn.model_selection import RandomizedSearchCV
+from sklearn.model_selection import GroupShuffleSplit, RandomizedSearchCV
 from sklearn.utils.class_weight import compute_sample_weight
+from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
 
 # All data-transformation logic lives in the shared preprocessing module so the
@@ -53,6 +54,24 @@ warnings.filterwarnings("ignore")
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 DEFAULT_DATASET_PATH = Path(__file__).resolve().parents[2] / "data" / "set A corporate_rating.csv"
+CV_METRICS_JSON_PATH = RESULTS_DIR / "xgboost_cv_metrics.json"
+
+
+def load_cv_metrics():
+    """Load the cached cross-validation summary written by evaluate_xgboost.py.
+
+    evaluate_xgboost.py is the single source of truth for reported accuracy
+    (see its module docstring and docs/XGBoost_Technical_Report.md). CV is
+    expensive (multiple full training runs), so it is run offline/on-demand
+    rather than on every prediction request; this just reads the cached
+    result. Returns None if the cache hasn't been generated yet.
+    """
+    if not CV_METRICS_JSON_PATH.exists():
+        return None
+    try:
+        return json.loads(CV_METRICS_JSON_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +140,7 @@ def _optimize_thresholds(y_true, y_proba, n_classes):
 
     best_score, best_thresholds = -1.0, np.ones(n_classes)
     rng = np.random.default_rng(RANDOM_STATE)
-    for _ in range(10):  # Restarts for threshold coverage
+    for _ in range(25):  # Restarts for threshold coverage
         init = rng.uniform(0.5, 2.0, n_classes)
         res = minimize(neg_f1, init, method="Nelder-Mead",
                        options={"maxiter": 2000, "xatol": 1e-5, "fatol": 1e-5})
@@ -132,46 +151,123 @@ def _optimize_thresholds(y_true, y_proba, n_classes):
     return best_thresholds / best_thresholds.sum() * n_classes
 
 
+def fit_thresholds_nested(X_train_enc, y_train, train_groups, best_params, n_classes,
+                           inner_test_size=0.2, random_state=RANDOM_STATE):
+    """Fit threshold multipliers and decide whether to use them, without ever
+    touching the outer test/CV fold (leakage-safe nested validation).
+
+    The production/CV model is always fit on the *entire* outer training fold
+    (more data -> a better final model). But if thresholds are tuned on that
+    same full training fold and then evaluated on it to decide whether to use
+    them, the decision is optimistic -- the thresholds get to "see" the exact
+    rows they're being scored against.
+
+    To avoid that, this carves out a company-level inner validation slice from
+    the outer training fold ONLY (never touching the outer test fold), fits a
+    single quick model (reusing best_params already found by hyperparameter
+    search) on the inner-train slice, and fits/evaluates thresholds purely on
+    the inner-validation slice. The thresholds and use/don't-use decision
+    coming out of this are then applied to the real, fully-trained model's
+    predictions on the outer test fold.
+
+    Falls back to fitting thresholds on the full outer training fold (old
+    behaviour) if a grouped inner split isn't possible (e.g. too few groups,
+    or ``train_groups`` is ``None`` because the outer split had to fall back
+    to a non-grouped strategy).
+    """
+    inner_train_idx = inner_val_idx = None
+    if train_groups is not None:
+        try:
+            gss = GroupShuffleSplit(n_splits=1, test_size=inner_test_size, random_state=random_state)
+            inner_train_idx, inner_val_idx = next(gss.split(X_train_enc, y_train, train_groups))
+        except (ValueError, StopIteration):
+            inner_train_idx = inner_val_idx = None
+
+    if inner_train_idx is None or len(inner_val_idx) == 0 or len(inner_train_idx) == 0:
+        # Fallback: can't form a leakage-safe inner split (e.g. very few
+        # groups). Fit thresholds on the full outer-training fold instead --
+        # less rigorous, but still never touches the outer test/CV fold.
+        quick_model = XGBClassifier(**{**best_params, "random_state": random_state, "n_jobs": -1})
+        quick_model.fit(X_train_enc, y_train)
+        proba_val = quick_model.predict_proba(X_train_enc)
+        y_val = y_train
+    else:
+        X_inner_tr = X_train_enc.iloc[inner_train_idx]
+        y_inner_tr = y_train[inner_train_idx]
+        X_inner_val = X_train_enc.iloc[inner_val_idx]
+        y_val = y_train[inner_val_idx]
+
+        quick_model = XGBClassifier(**{**best_params, "random_state": random_state, "n_jobs": -1})
+        quick_model.fit(X_inner_tr, y_inner_tr)
+        proba_val = quick_model.predict_proba(X_inner_val)
+
+    thresholds = _optimize_thresholds(y_val, proba_val, n_classes)
+
+    f1_standard = f1_score(y_val, proba_val.argmax(axis=1), average="macro")
+    f1_threshold = f1_score(y_val, (proba_val * thresholds).argmax(axis=1), average="macro")
+    use_thresholds = f1_threshold > f1_standard
+
+    return thresholds, use_thresholds
+
+
 def train_model(X_train_enc, y_train):
     """Fit an ensemble of XGBoost models with aggressive tuning for 75%+ accuracy.
 
     Strategy:
-    1. Expand hyperparameter grid to cover more of the search space
-    2. Train 3 XGBoost models with different random seeds
-    3. Soft-vote ensemble for robustness
-    4. Isotonic calibration on the ensemble
+    1. Apply SMOTE to oversample minority classes (especially Distressed)
+    2. Expand hyperparameter grid to cover more of the search space
+    3. Train 5 XGBoost models with different random seeds
+    4. Soft-vote ensemble for robustness
     """
-    sample_weights = compute_sample_weight(class_weight="balanced", y=y_train)
+    from imblearn.over_sampling import SMOTE
+
+    # Apply SMOTE to balance classes before training. The Distressed class
+    # (~57 training samples per fold) is too small relative to the majority
+    # classes for the model to learn reliable decision boundaries.
+    # k_neighbors is capped to min(5, smallest_class_count - 1) so SMOTE
+    # doesn't crash when a minority class is very small.
+    class_counts = pd.Series(y_train).value_counts()
+    min_class_count = int(class_counts.min())
+    k_neighbors = min(5, max(1, min_class_count - 1))
+
+    if min_class_count >= 2:
+        smote = SMOTE(
+            random_state=RANDOM_STATE,
+            k_neighbors=k_neighbors,
+        )
+        X_train_enc, y_train = smote.fit_resample(X_train_enc, y_train)
+
+    sample_weights = None
 
     base_model = XGBClassifier(
         objective="multi:softprob",
         eval_metric="mlogloss",
         use_label_encoder=False,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        colsample_bylevel=0.8,
         random_state=RANDOM_STATE,  # Model 1 seed — required for reproducibility
         n_jobs=-1,
     )
 
-    # Aggressive grid — favors deeper trees + more regularization
+    # features, deep/many trees + light regularization let the model
+    # memorize training-fold noise rather than learn generalizable ratio
+    # relationships. This grid caps depth and estimator count and raises the
+    # regularization floors to shrink that gap.
     param_grid = {
-        "max_depth":        [5, 7, 9],
-        "n_estimators":     [150, 200],
+        "max_depth":        [2, 3, 4],
+        "n_estimators":     [50, 75, 100],
         "learning_rate":    [0.03, 0.05, 0.1],
-        "min_child_weight": [1, 3, 5],
-        "gamma":            [0, 0.1, 0.2],
-        "reg_alpha":        [0, 0.1, 0.3],
-        "reg_lambda":       [1, 1.5],
+        "min_child_weight": [5, 10, 15],
+        "gamma":            [0.1, 0.3, 0.5],
+        "reg_alpha":        [0.3, 0.5, 1.0],
+        "reg_lambda":       [1.5, 2.0, 3.0],
     }
 
-    # Model 1 — best from RandomizedSearchCV (15 samples from the grid)
+    # Model 1 — best from RandomizedSearchCV (50 samples from the grid)
     grid = RandomizedSearchCV(
         estimator=base_model,
         param_distributions=param_grid,
-        n_iter=15,
-        scoring="f1_macro",
-        cv=3,
+        n_iter=50,
+        scoring="accuracy",
+        cv=5,
         n_jobs=-1,
         refit=True,
         random_state=RANDOM_STATE,
@@ -180,33 +276,36 @@ def train_model(X_train_enc, y_train):
     grid.fit(X_train_enc, y_train, sample_weight=sample_weights)
     best_xgb = grid.best_estimator_
 
-    # Model 2 & 3 — retrain best config with different random seeds for diversity
+    # Models 2-5 — retrain best config with different random seeds for diversity
     best_params = grid.best_params_
     xgb_2 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 1, "n_jobs": -1})
     xgb_3 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 2, "n_jobs": -1})
+    xgb_4 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 3, "n_jobs": -1})
+    xgb_5 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 4, "n_jobs": -1})
 
     xgb_2.fit(X_train_enc, y_train, sample_weight=sample_weights)
     xgb_3.fit(X_train_enc, y_train, sample_weight=sample_weights)
+    xgb_4.fit(X_train_enc, y_train, sample_weight=sample_weights)
+    xgb_5.fit(X_train_enc, y_train, sample_weight=sample_weights)
 
     # Soft voting ensemble
     ensemble = VotingClassifier(
-        estimators=[("xgb1", best_xgb), ("xgb2", xgb_2), ("xgb3", xgb_3)],
+        estimators=[
+            ("xgb1", best_xgb), 
+            ("xgb2", xgb_2), 
+            ("xgb3", xgb_3),
+            ("xgb4", xgb_4),
+            ("xgb5", xgb_5)
+        ],
         voting="soft",
         n_jobs=-1,
     )
     ensemble.fit(X_train_enc, y_train, sample_weight=sample_weights)
 
-    # Calibrate the ensemble (fall back to fewer folds for tiny minority classes)
-    for cv_folds in (3, 2):
-        try:
-            calibrated = CalibratedClassifierCV(estimator=ensemble, method="isotonic", cv=cv_folds)
-            calibrated.fit(X_train_enc, y_train, sample_weight=sample_weights)
-            break
-        except ValueError:
-            if cv_folds == 2:
-                raise
-
-    return best_xgb, calibrated  # Return base model for SHAP, calibrated ensemble for predictions
+    # best_params returned alongside so callers (threshold-fitting, CV) can
+    # refit small "quick" models with the same hyperparameters without
+    # re-running the full RandomizedSearchCV.
+    return best_xgb, ensemble, best_params  # base model for SHAP, ensemble for predictions, params for reuse
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +392,11 @@ def main():
         X = df.drop(columns=[c for c in DROP_COLS if c in df.columns])
 
         # ── Train / test split (company-level, leakage-safe) ─────────────────
-        X_train, X_test, y_train, y_test, split_strategy = make_split(
+        # Must match the grouped, company-level protocol used by
+        # evaluate_xgboost.py — the CV script is now the single source of
+        # truth for reported accuracy, and this single split exists only as a
+        # live demo of the same methodology on one particular held-out slice.
+        X_train, X_test, y_train, y_test, split_strategy, train_groups = make_split(
             X, y_encoded, groups=groups, test_size=0.20, random_state=RANDOM_STATE
         )
 
@@ -350,19 +453,20 @@ def main():
             X_test_enc = X_test_enc.reindex(columns=selected_features, fill_value=0)
             feature_columns = selected_features
 
-            best_xgb, calibrated_model = train_model(X_train_enc, y_train)
+            best_xgb, calibrated_model, best_params = train_model(X_train_enc, y_train)
 
-            # Threshold optimisation (values learned on training data only)
-            y_train_proba = calibrated_model.predict_proba(X_train_enc)
-            optimal_thresholds = _optimize_thresholds(y_train, y_train_proba, len(LABEL_ENCODER.classes_))
-
-            # Strategy selector decided on TRAINING data only (no test-set peek).
-            # Previously this compared macro-F1 on y_test, which leaked test labels
-            # into the choice of whether to apply thresholds (documented in §4.6)
-            # and optimistically inflated reported metrics.
-            f1_standard = f1_score(y_train, calibrated_model.predict(X_train_enc), average="macro")
-            f1_threshold = f1_score(y_train, (y_train_proba * optimal_thresholds).argmax(axis=1), average="macro")
-            use_thresholds = f1_threshold > f1_standard
+            # ── Threshold optimisation (nested, leakage-safe) ─────────────────
+            # Thresholds are fit and the use/don't-use decision is made on a
+            # company-level inner validation slice carved out of the outer
+            # TRAINING fold only (never the outer test fold, and never using
+            # rows the model was actually fit on to make the decision). This
+            # mirrors exactly what evaluate_xgboost.py does inside each CV
+            # fold, so the dashboard's single-split numbers and the CV numbers
+            # come from the same methodology. See fit_thresholds_nested().
+            optimal_thresholds, use_thresholds = fit_thresholds_nested(
+                X_train_enc, y_train, train_groups, best_params,
+                n_classes=len(LABEL_ENCODER.classes_),
+            )
 
             # Persist cache
             joblib.dump(calibrated_model, paths["calibrated_model"])
@@ -413,6 +517,52 @@ def main():
         # ── Response payload ─────────────────────────────────────────────────
         pred_labels = LABEL_ENCODER.inverse_transform(pred_indices)
 
+        # evaluate_xgboost.py's grouped 5-fold CV is the authoritative,
+        # reported accuracy figure (low-variance, averaged over folds). This
+        # single split is a live demo of the same methodology on one
+        # particular held-out slice, and is shown as a SECONDARY figure only
+        # -- a single split over ~593 companies is a high-variance estimate,
+        # so it should never be presented as competing with the CV number.
+        cv_metrics = load_cv_metrics()
+        if cv_metrics:
+            primary_metrics = {
+                "accuracy": f"{cv_metrics['test_accuracy_mean']:.4f}",
+                "accuracyStd": f"{cv_metrics['test_accuracy_std']:.4f}",
+                "f1": f"{cv_metrics['test_macro_f1_mean']:.4f}",
+                "f1Std": f"{cv_metrics['test_macro_f1_std']:.4f}",
+                "cvFolds": cv_metrics["cv_folds"],
+                "label": (
+                    f"{cv_metrics['test_accuracy_mean']*100:.1f}% ± "
+                    f"{cv_metrics['test_accuracy_std']*100:.1f}% "
+                    f"({cv_metrics['cv_folds']}-fold grouped CV)"
+                ),
+                "strength": (
+                    "Reported accuracy is the grouped, company-level 5-fold CV mean "
+                    "(the authoritative, low-variance figure) -- not a single lucky split."
+                ),
+                "weakness": (
+                    f"Distressed class remains hard to learn "
+                    f"(mean F1 {cv_metrics['per_class_f1_mean'].get('Distressed', 0):.2f}) "
+                    f"given severe class imbalance and limited company count."
+                ),
+            }
+        else:
+            primary_metrics = None
+
+        secondary_metrics = {
+            "accuracy": f"{acc:.4f}",
+            "precision": f"{precision:.4f}",
+            "recall": f"{recall:.4f}",
+            "f1": f"{f1:.4f}",
+            "label": "single-split demo, high variance — see CV mean for reported accuracy",
+            "note": (
+                "This is one grouped, company-level train/test split, shown live for "
+                "this dataset. A single split over ~593 companies has high variance "
+                "(observed range ~45%-70% across different held-out splits); it is not "
+                "the reported model accuracy. See the primary CV metrics above."
+            ),
+        }
+
         result = {
             "prediction": format_prediction_label(pred_labels[0]),
             "probabilities": {
@@ -422,14 +572,16 @@ def main():
             "modelData": {
                 "tag": "XGBoost",
                 "labels": ["Investment-High", "Investment-Low", "Speculative", "Distressed"],
-                "metrics": {
-                    "accuracy": f"{acc:.4f}",
-                    "precision": f"{precision:.4f}",
-                    "recall": f"{recall:.4f}",
-                    "f1": f"{f1:.4f}",
-                    "strength": "3-model soft-voting ensemble; isotonic-calibrated + threshold-optimized; company-level leakage-safe split; imputation + feature selection.",
-                    "weakness": "May overfit if the dataset is too small or highly imbalanced.",
+                # Primary metrics: CV mean +/- std (falls back to the single-split
+                # metrics only if the CV cache hasn't been generated yet, so the
+                # dashboard still renders something before the first offline
+                # `python evaluate_xgboost.py` run).
+                "metrics": primary_metrics or {
+                    **secondary_metrics,
+                    "strength": "CV metrics cache not yet generated — run evaluate_xgboost.py to compute the authoritative accuracy.",
                 },
+                "cvMetrics": primary_metrics,
+                "singleSplitMetrics": secondary_metrics,
                 "matrix": cm.tolist(),
                 "shap": shap_data,
                 "shapStory": shap_story,

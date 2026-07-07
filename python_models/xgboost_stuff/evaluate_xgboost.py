@@ -1,8 +1,24 @@
 """Authoritative offline evaluation for the XGBoost credit-risk pipeline.
 
-A single train/test split over ~593 companies is a high-variance estimate, so
-this script reports **grouped, stratified k-fold cross-validation** — the
-honest, stable performance number to cite in the technical report.
+This is the SINGLE SOURCE OF TRUTH for reported model performance (see
+docs/XGBoost_Technical_Report.md and the dissertation write-up). A single
+train/test split over ~593 companies is a high-variance estimate (the same
+pipeline has been observed to swing from ~45% to ~70% single-split accuracy
+purely based on which companies land in the held-out fold), so this script
+reports **grouped, stratified k-fold cross-validation** — the honest, stable
+performance number to cite.
+
+Methodological alignment with the dashboard (predict_xgboost.py):
+- Same model: train_model() (SMOTE oversampling + 5-seed XGBoost soft-voting
+  ensemble with the same regularised hyperparameter grid) is imported from
+  predict_xgboost.py and used unmodified here, so the CV number and the
+  dashboard's single-split demo number are measuring the *same* model, not
+  two different pipelines that happen to share a name.
+- Same threshold protocol: threshold optimisation and the use/don't-use
+  decision are performed with fit_thresholds_nested() -- a company-level
+  inner train/validation split carved out of each outer TRAINING fold only.
+  The outer test fold is never touched until the single final scoring call.
+  This mirrors exactly what the dashboard does for its single split.
 
 Key properties:
 - Company-level grouping (StratifiedGroupKFold on Symbol/Name): no company
@@ -10,21 +26,23 @@ Key properties:
   company-level leakage.
 - Per-fold preprocessing: imputation, winsorization, sector z-scores, and
   feature selection are all fit on the training fold only.
-- Standard (calibrated) predictions are used — the threshold *strategy
-  selector* is deliberately skipped here because it peeks at test labels
-  (documented leakage), which would bias a CV estimate.
+- Results (per-fold and mean/std) are persisted to xgboost_cv_metrics.json so
+  the dashboard can display the CV mean ± std as the primary, authoritative
+  accuracy figure without re-running this expensive CV on every request.
 
 Run:  python evaluate_xgboost.py           (uses the default dataset)
       python evaluate_xgboost.py 5          (override number of folds)
 """
 
+import json
 import sys
 import warnings
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 
 from preprocessing import (
     LABEL_ENCODER,
@@ -42,9 +60,11 @@ from preprocessing import (
     group_rating,
     winsorize_features,
 )
-from predict_xgboost import DEFAULT_DATASET_PATH, RESULTS_DIR, train_model
+from predict_xgboost import DEFAULT_DATASET_PATH, RESULTS_DIR, fit_thresholds_nested, train_model
 
 warnings.filterwarnings("ignore")
+
+CV_METRICS_JSON_PATH = RESULTS_DIR / "xgboost_cv_metrics.json"
 
 
 def preprocess_fold(X_train, X_test):
@@ -79,48 +99,164 @@ def main():
     X = df.drop(columns=[c for c in DROP_COLS if c in df.columns])
 
     sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
+    n_classes = len(LABEL_ENCODER.classes_)
 
     accs, macro_f1s = [], []
+    train_accs, train_macro_f1s = [], []
     per_class_f1 = {c: [] for c in LABEL_ENCODER.classes_}
+    fold_records = []
+    thresholds_used_count = 0
 
     for i, (tr, te) in enumerate(sgkf.split(X, y, groups), 1):
         X_tr, X_te = X.iloc[tr], X.iloc[te]
         y_tr, y_te = y[tr], y[te]
+        groups_tr = groups[tr] if groups is not None else None
 
         X_tr_enc, X_te_enc = preprocess_fold(X_tr, X_te)
-        best_xgb, calibrated = train_model(X_tr_enc, y_tr)
-        preds = calibrated.predict(X_te_enc)
+
+        # Same model as the dashboard: SMOTE + 5-seed XGBoost soft-voting
+        # ensemble, identical hyperparameter grid (train_model imported
+        # directly from predict_xgboost.py -- one implementation, not two).
+        best_xgb, ensemble, best_params = train_model(X_tr_enc, y_tr)
+
+        # Same threshold protocol as the dashboard: fit + decide on a
+        # company-level inner validation slice carved out of THIS fold's
+        # training data only. The outer test fold (X_te_enc/y_te) is not
+        # touched until the scoring call below.
+        thresholds, use_thresholds = fit_thresholds_nested(
+            X_tr_enc, y_tr, groups_tr, best_params, n_classes=n_classes,
+        )
+        if use_thresholds:
+            thresholds_used_count += 1
+
+        proba_te = ensemble.predict_proba(X_te_enc)
+        proba_tr = ensemble.predict_proba(X_tr_enc)
+        preds = (proba_te * thresholds).argmax(axis=1) if use_thresholds else proba_te.argmax(axis=1)
+        train_preds = (proba_tr * thresholds).argmax(axis=1) if use_thresholds else proba_tr.argmax(axis=1)
 
         acc = accuracy_score(y_te, preds)
         macro = f1_score(y_te, preds, average="macro")
-        f1_by_class = f1_score(y_te, preds, average=None, labels=[0, 1, 2, 3], zero_division=0)
+        f1_by_class = f1_score(
+            y_te, preds, average=None,
+            labels=list(range(n_classes)), zero_division=0,
+        )
+
+        train_acc = accuracy_score(y_tr, train_preds)
+        train_macro = f1_score(y_tr, train_preds, average="macro")
 
         accs.append(acc)
         macro_f1s.append(macro)
+        train_accs.append(train_acc)
+        train_macro_f1s.append(train_macro)
         for idx, cls in enumerate(LABEL_ENCODER.classes_):
             per_class_f1[cls].append(f1_by_class[idx])
 
-        print(f"fold {i}/{n_splits}: n_test={len(y_te)} acc={acc:.4f} macroF1={macro:.4f}", flush=True)
+        gap = train_acc - acc
+        fold_records.append({
+            "fold": i,
+            "n_train": int(len(y_tr)),
+            "n_test": int(len(y_te)),
+            "train_accuracy": round(float(train_acc), 4),
+            "test_accuracy": round(float(acc), 4),
+            "train_test_gap": round(float(gap), 4),
+            "train_macro_f1": round(float(train_macro), 4),
+            "test_macro_f1": round(float(macro), 4),
+            "used_thresholds": bool(use_thresholds),
+        })
+        print(
+            f"fold {i}/{n_splits}: n_train={len(y_tr)} n_test={len(y_te)} "
+            f"train_acc={train_acc:.4f} test_acc={acc:.4f} gap={gap:.4f} "
+            f"train_macroF1={train_macro:.4f} test_macroF1={macro:.4f} "
+            f"used_thresholds={use_thresholds}",
+            flush=True,
+        )
 
     accs = np.array(accs)
     macro_f1s = np.array(macro_f1s)
+    train_accs = np.array(train_accs)
+    train_macro_f1s = np.array(train_macro_f1s)
+    acc_gap = train_accs.mean() - accs.mean()
+    macro_gap = train_macro_f1s.mean() - macro_f1s.mean()
+
+    # Rough overfitting read: a large train/test gap points to overfitting
+    # (too much model/feature capacity for the data); a small gap with a low
+    # test score points to underfitting/data-starvation instead, where
+    # trimming features is unlikely to help much.
+    if acc_gap > 0.15:
+        overfit_verdict = (
+            f"LIKELY OVERFITTING: train accuracy exceeds test accuracy by "
+            f"{acc_gap:.4f} (>{0.15:.2f} threshold). Feature-space reduction, "
+            f"stronger regularization, or fewer boosting rounds are worth trying."
+        )
+    elif acc_gap > 0.08:
+        overfit_verdict = (
+            f"MILD OVERFITTING SIGNAL: train/test accuracy gap is {acc_gap:.4f}. "
+            f"Some benefit possible from trimming features or adding regularization, "
+            f"but this is not the dominant issue."
+        )
+    else:
+        overfit_verdict = (
+            f"NOT OVERFITTING: train/test accuracy gap is only {acc_gap:.4f}. "
+            f"The model is closer to under-fit / data-starved than over-fit — "
+            f"cutting features is unlikely to move the test score much. The "
+            f"ceiling is more likely driven by sample size (593 companies) and "
+            f"class imbalance (Distressed ~3.6%) than by feature-space size."
+        )
+
+    per_class_f1_means = {cls: float(np.array(vals).mean()) for cls, vals in per_class_f1.items()}
 
     lines = [
         f"cv_folds: {n_splits}",
         "split: grouped_stratified (company-level, leakage-safe)",
-        "prediction: standard calibrated (no threshold strategy selector)",
+        f"threshold_protocol: nested company-level inner split per fold "
+        f"(used in {thresholds_used_count}/{n_splits} folds)",
+        f"train_accuracy_mean: {train_accs.mean():.4f}",
+        f"train_accuracy_std: {train_accs.std():.4f}",
+        f"test_accuracy_mean: {accs.mean():.4f}",
+        f"test_accuracy_std: {accs.std():.4f}",
+        f"train_test_accuracy_gap: {acc_gap:.4f}",
+        f"train_macro_f1_mean: {train_macro_f1s.mean():.4f}",
+        f"test_macro_f1_mean: {macro_f1s.mean():.4f}",
+        f"train_test_macro_f1_gap: {macro_gap:.4f}",
+        # Kept for backward compatibility with anything parsing these keys.
         f"accuracy_mean: {accs.mean():.4f}",
         f"accuracy_std: {accs.std():.4f}",
         f"macro_f1_mean: {macro_f1s.mean():.4f}",
         f"macro_f1_std: {macro_f1s.std():.4f}",
+        "",
+        overfit_verdict,
     ]
     for cls in LABEL_ENCODER.classes_:
-        vals = np.array(per_class_f1[cls])
-        lines.append(f"f1_{cls}_mean: {vals.mean():.4f}")
+        lines.append(f"f1_{cls}_mean: {per_class_f1_means[cls]:.4f}")
 
     output = "\n".join(lines) + "\n"
     (RESULTS_DIR / "xgboost_cv_metrics.txt").write_text(output)
     print("\n" + output, flush=True)
+
+    # ── JSON cache: consumed by predict_xgboost.py so the dashboard can show
+    # the CV mean +/- std as the primary, authoritative accuracy figure
+    # without re-running this (expensive) cross-validation on every request.
+    cv_summary = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "cv_folds": n_splits,
+        "split_strategy": "grouped_stratified",
+        "threshold_protocol": "nested_company_level_inner_split",
+        "thresholds_used_in_folds": thresholds_used_count,
+        "test_accuracy_mean": round(float(accs.mean()), 4),
+        "test_accuracy_std": round(float(accs.std()), 4),
+        "train_accuracy_mean": round(float(train_accs.mean()), 4),
+        "train_accuracy_std": round(float(train_accs.std()), 4),
+        "train_test_accuracy_gap": round(float(acc_gap), 4),
+        "test_macro_f1_mean": round(float(macro_f1s.mean()), 4),
+        "test_macro_f1_std": round(float(macro_f1s.std()), 4),
+        "train_macro_f1_mean": round(float(train_macro_f1s.mean()), 4),
+        "train_test_macro_f1_gap": round(float(macro_gap), 4),
+        "per_class_f1_mean": {cls: round(v, 4) for cls, v in per_class_f1_means.items()},
+        "overfit_verdict": overfit_verdict,
+        "folds": fold_records,
+    }
+    CV_METRICS_JSON_PATH.write_text(json.dumps(cv_summary, indent=2))
+    print(f"CV metrics cached to {CV_METRICS_JSON_PATH}", flush=True)
 
 
 if __name__ == "__main__":

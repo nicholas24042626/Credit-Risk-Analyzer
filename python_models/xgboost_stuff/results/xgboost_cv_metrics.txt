@@ -1,11 +1,21 @@
 cv_folds: 5
 split: grouped_stratified (company-level, leakage-safe)
-prediction: standard calibrated (no threshold strategy selector)
-accuracy_mean: 0.4618
-accuracy_std: 0.0329
-macro_f1_mean: 0.4151
-macro_f1_std: 0.0267
-f1_Investment_High_mean: 0.5521
-f1_Investment_Low_mean: 0.3749
-f1_Speculative_mean: 0.5042
-f1_Distressed_mean: 0.2292
+threshold_protocol: nested company-level inner split per fold (used in 5/5 folds)
+train_accuracy_mean: 0.8820
+train_accuracy_std: 0.0262
+test_accuracy_mean: 0.5007
+test_accuracy_std: 0.0372
+train_test_accuracy_gap: 0.3812
+train_macro_f1_mean: 0.8551
+test_macro_f1_mean: 0.4513
+train_test_macro_f1_gap: 0.4038
+accuracy_mean: 0.5007
+accuracy_std: 0.0372
+macro_f1_mean: 0.4513
+macro_f1_std: 0.0321
+
+LIKELY OVERFITTING: train accuracy exceeds test accuracy by 0.3812 (>0.15 threshold). Feature-space reduction, stronger regularization, or fewer boosting rounds are worth trying.
+f1_Investment_High_mean: 0.5397
+f1_Investment_Low_mean: 0.4597
+f1_Speculative_mean: 0.5473
+f1_Distressed_mean: 0.2585

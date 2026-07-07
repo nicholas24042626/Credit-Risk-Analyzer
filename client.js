@@ -52,6 +52,10 @@ function initApp() {
   const shapNarrative = document.getElementById("shapNarrative");
   const matrixGrid = document.getElementById("matrixGrid");
   const shapBars = document.getElementById("shapBars");
+  const performanceLabel = document.getElementById("performanceLabel");
+  const secondaryMetricsSection = document.getElementById("secondaryMetricsSection");
+  const secondaryMetricsNote = document.getElementById("secondaryMetricsNote");
+  const secondaryStats = document.getElementById("secondaryStats");
   const ratioInputs = document.querySelectorAll("[data-ratio-feature]");
   const ratioForm = document.getElementById("ratioForm");
   const predictionResult = document.getElementById("predictionResult");
@@ -251,9 +255,13 @@ function initApp() {
   }
 
   function renderMetrics(model) {
-    const metrics = modelData[model]?.metrics;
+    const entry = modelData[model] || {};
+    const metrics = entry.metrics;
+    const cvMetrics = entry.cvMetrics;
+    const singleSplitMetrics = entry.singleSplitMetrics;
 
     if (!metrics) {
+      performanceLabel.textContent = "Key evaluation metrics for the selected model, plus a short read on the main strength and weakness.";
       performanceStats.innerHTML = `
         <div class="mini-card">
           <h5>Accuracy</h5>
@@ -275,30 +283,90 @@ function initApp() {
       performanceStrength.textContent = "Train the model to calculate metrics from the uploaded dataset.";
       performanceWeakness.textContent = "No static Random Forest metrics are shown before training.";
       shapSummary.textContent = `Feature importance for ${model} appears after training.`;
+      secondaryMetricsSection.style.display = "none";
       return;
     }
 
-    performanceStats.innerHTML = `
-      <div class="mini-card">
-        <h5>Accuracy</h5>
-        <p>${metrics.accuracy}</p>
-      </div>
-      <div class="mini-card">
-        <h5>Precision</h5>
-        <p>${metrics.precision}</p>
-      </div>
-      <div class="mini-card">
-        <h5>Recall</h5>
-        <p>${metrics.recall}</p>
-      </div>
-      <div class="mini-card">
-        <h5>F1-score</h5>
-        <p>${metrics.f1}</p>
-      </div>
-    `;
+    // Primary card: for models that report cross-validated metrics (currently
+    // XGBoost), this is the CV mean +/- std — the authoritative, low-variance
+    // reported accuracy. For models without a CV cache yet, this falls back
+    // to whatever the backend put in `metrics` (a single-split figure, with
+    // its own explicit caveat baked into the strength/weakness text).
+    if (cvMetrics) {
+      performanceLabel.textContent =
+        `Reported accuracy (primary): ${cvMetrics.label}. This is the authoritative, ` +
+        `cross-validated figure — not a single train/test split.`;
+      performanceStats.innerHTML = `
+        <div class="mini-card">
+          <h5>Accuracy (CV mean)</h5>
+          <p>${metrics.accuracy} ± ${cvMetrics.accuracyStd}</p>
+        </div>
+        <div class="mini-card">
+          <h5>Macro F1 (CV mean)</h5>
+          <p>${metrics.f1} ± ${cvMetrics.f1Std}</p>
+        </div>
+        <div class="mini-card">
+          <h5>CV folds</h5>
+          <p>${cvMetrics.cvFolds}</p>
+        </div>
+        <div class="mini-card">
+          <h5>Split strategy</h5>
+          <p>Grouped, company-level</p>
+        </div>
+      `;
+    } else {
+      performanceLabel.textContent = "Key evaluation metrics for the selected model, plus a short read on the main strength and weakness.";
+      performanceStats.innerHTML = `
+        <div class="mini-card">
+          <h5>Accuracy</h5>
+          <p>${metrics.accuracy}</p>
+        </div>
+        <div class="mini-card">
+          <h5>Precision</h5>
+          <p>${metrics.precision ?? "-"}</p>
+        </div>
+        <div class="mini-card">
+          <h5>Recall</h5>
+          <p>${metrics.recall ?? "-"}</p>
+        </div>
+        <div class="mini-card">
+          <h5>F1-score</h5>
+          <p>${metrics.f1}</p>
+        </div>
+      `;
+    }
+
     performanceStrength.textContent = metrics.strength;
     performanceWeakness.textContent = metrics.weakness;
     shapSummary.textContent = `SHAP explains which features pushed the company toward its predicted risk class for ${model}.`;
+
+    // Secondary card: single-split demo metrics, only shown (collapsed by
+    // default via <details>) when the backend explicitly separated it out.
+    // Labeled clearly so it never reads as competing with the primary figure.
+    if (singleSplitMetrics) {
+      secondaryMetricsSection.style.display = "block";
+      secondaryMetricsNote.textContent = singleSplitMetrics.note || singleSplitMetrics.label || "";
+      secondaryStats.innerHTML = `
+        <div class="mini-card">
+          <h5>Accuracy</h5>
+          <p>${singleSplitMetrics.accuracy}</p>
+        </div>
+        <div class="mini-card">
+          <h5>Precision</h5>
+          <p>${singleSplitMetrics.precision ?? "-"}</p>
+        </div>
+        <div class="mini-card">
+          <h5>Recall</h5>
+          <p>${singleSplitMetrics.recall ?? "-"}</p>
+        </div>
+        <div class="mini-card">
+          <h5>F1-score</h5>
+          <p>${singleSplitMetrics.f1}</p>
+        </div>
+      `;
+    } else {
+      secondaryMetricsSection.style.display = "none";
+    }
   }
 
   // Returns the currently active model name from the button group.

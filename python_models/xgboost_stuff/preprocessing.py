@@ -48,10 +48,15 @@ WINSOR_UPPER_PCT = 99
 
 # Feature-selection thresholds.
 NEAR_ZERO_VAR_THRESHOLD = 1e-8   # drop columns with essentially no variance
-HIGH_CORR_THRESHOLD = 0.95       # drop one of any pair correlated above this
+HIGH_CORR_THRESHOLD = 0.98       # drop one of any pair correlated above this
 
 # Number of folds used to carve out the held-out test set (1/N ~= test size).
 SPLIT_N_FOLDS = 5
+
+# Minimum training-fold row count a sector needs before its own mean/std are
+# trusted for z-score normalisation; smaller sectors fall back to global
+# stats (see compute_sector_stats) to avoid noisy per-sector estimates.
+MIN_SECTOR_GROUP_SIZE = 20
 
 # Columns never used as predictors.
 DROP_COLS = frozenset(
@@ -155,6 +160,18 @@ def group_rating(r):
     Investment_Low  : BBB
     Speculative     : BB, B
     Distressed      : CCC, CC, C, D
+
+    This must stay in sync with the other four group_rating()/ratingRuleEngine
+    implementations: predict_decision_tree.py, predict_random_forest.py,
+    predict_logistic_regression.py, and client.js. See
+    docs/XGBoost_Technical_Report.md §2.3 for the justification (CCC/CC are
+    grouped with Distressed, not Speculative, so the Distressed tier has
+    enough support to be measurable).
+
+    A 3-class variant (Distressed merged into Speculative) was tested as a
+    diagnostic and did raise CV accuracy (~46% -> ~56%), but was reverted to
+    keep this model's class definition consistent with the rest of the
+    dashboard.
     """
     r = str(r).strip().upper()
     if r in {"AAA", "AA", "A"}:
@@ -351,6 +368,12 @@ def make_split(X, y, groups=None, test_size=0.20, random_state=RANDOM_STATE):
 
     Falls back to stratified ``train_test_split`` when groups are unavailable
     or produce too few members to split, and finally to a plain split.
+
+    Returns ``(X_train, X_test, y_train, y_test, split_strategy, train_groups)``.
+    ``train_groups`` is the ``groups`` array sliced to the training rows (or
+    ``None`` if no groups were provided/used), so callers can perform a further
+    leakage-safe, company-level *nested* split within the training fold (e.g.
+    for threshold tuning) without re-deriving the grouping key.
     """
     if groups is not None:
         try:
@@ -359,10 +382,12 @@ def make_split(X, y, groups=None, test_size=0.20, random_state=RANDOM_STATE):
                 n_splits=n_folds, shuffle=True, random_state=random_state
             )
             train_idx, test_idx = next(sgkf.split(X, y, groups))
+            groups_arr = np.asarray(groups)
             return (
                 X.iloc[train_idx], X.iloc[test_idx],
                 y[train_idx], y[test_idx],
                 "grouped_stratified",
+                groups_arr[train_idx],
             )
         except Exception:
             pass
@@ -371,12 +396,12 @@ def make_split(X, y, groups=None, test_size=0.20, random_state=RANDOM_STATE):
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state, stratify=y
         )
-        return X_train, X_test, y_train, y_test, "stratified"
+        return X_train, X_test, y_train, y_test, "stratified", None
     except ValueError:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state
         )
-        return X_train, X_test, y_train, y_test, "random"
+        return X_train, X_test, y_train, y_test, "random", None
 
 
 # ---------------------------------------------------------------------------
@@ -450,6 +475,19 @@ def add_interaction_features(X):
     def safe_div(a, b_col):
         return (out[a] / (out[b_col].abs() + EPS)).clip(-CLIP_BOUND, CLIP_BOUND)
 
+    # Altman Z-Score proxies and basic additions
+    if "currentRatio" in cols:
+        out["working_capital_proxy"] = out["currentRatio"] - 1.0
+
+    if {"netProfitMargin", "assetTurnover"} <= cols:
+        out["net_income_to_assets"] = (out["netProfitMargin"] * out["assetTurnover"]).clip(-CLIP_BOUND, CLIP_BOUND)
+        
+    if {"ebitPerRevenue", "assetTurnover"} <= cols:
+        out["ebit_to_assets"] = (out["ebitPerRevenue"] * out["assetTurnover"]).clip(-CLIP_BOUND, CLIP_BOUND)
+        
+    if {"ebitPerRevenue", "netProfitMargin"} <= cols:
+        out["interest_tax_burden_proxy"] = (out["ebitPerRevenue"] - out["netProfitMargin"]).clip(-CLIP_BOUND, CLIP_BOUND)
+
     # Original 10 composite features
     if {"debtEquityRatio", "operatingProfitMargin"} <= cols:
         out["leverage_coverage"] = safe_div("debtEquityRatio", "operatingProfitMargin")
@@ -515,20 +553,42 @@ def add_interaction_features(X):
 # Sector-relative z-scores (fit on train only)
 # ---------------------------------------------------------------------------
 
-def compute_sector_stats(X_train_with_interactions):
-    """Compute per-sector mean/std needed for z-score features (train set only)."""
+def compute_sector_stats(X_train_with_interactions, min_group_size=MIN_SECTOR_GROUP_SIZE):
+    """Compute per-sector mean/std needed for z-score features (train set only).
+
+    Sectors with fewer than ``min_group_size`` training rows produce noisy
+    mean/std estimates (a handful of companies is not enough to characterise
+    a sector's "typical" ratio range), and those noisy per-sector statistics
+    were one contributor to the ~39-point train/test accuracy gap found by
+    ``evaluate_xgboost.py``. Such sectors fall back to the global mean/std
+    instead of their own, so the z-score feature reduces to a globally
+    normalised value rather than a spuriously precise sector-relative one.
+    """
     df = X_train_with_interactions
     ratios = [
         c for c in df.select_dtypes(include="number").columns
         if "log" not in c and not c.startswith("Sector_")
     ]
+    sector_sizes = df.groupby("Sector").size()
+    reliable_sectors = sector_sizes[sector_sizes >= min_group_size].index
+
     means = df.groupby("Sector")[ratios].mean()
     stds = df.groupby("Sector")[ratios].std().fillna(1.0)
+
+    global_means = df[ratios].mean()
+    global_stds = df[ratios].std().fillna(1.0)
+
+    # Overwrite small-sector rows with global stats (broadcast row-wise).
+    unreliable_mask = ~means.index.isin(reliable_sectors)
+    if unreliable_mask.any():
+        means.loc[unreliable_mask, :] = global_means.values
+        stds.loc[unreliable_mask, :] = global_stds.values
+
     return {
         "means": means,
         "stds": stds,
-        "global_means": df[ratios].mean(),
-        "global_stds": df[ratios].std().fillna(1.0),
+        "global_means": global_means,
+        "global_stds": global_stds,
         "ratios": ratios,
     }
 

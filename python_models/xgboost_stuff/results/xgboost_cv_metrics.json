@@ -1,0 +1,80 @@
+{
+  "generated_at": "2026-07-07T05:36:18.036031+00:00",
+  "cv_folds": 5,
+  "split_strategy": "grouped_stratified",
+  "threshold_protocol": "nested_company_level_inner_split",
+  "thresholds_used_in_folds": 5,
+  "test_accuracy_mean": 0.5007,
+  "test_accuracy_std": 0.0372,
+  "train_accuracy_mean": 0.882,
+  "train_accuracy_std": 0.0262,
+  "train_test_accuracy_gap": 0.3812,
+  "test_macro_f1_mean": 0.4513,
+  "test_macro_f1_std": 0.0321,
+  "train_macro_f1_mean": 0.8551,
+  "train_test_macro_f1_gap": 0.4038,
+  "per_class_f1_mean": {
+    "Investment_High": 0.5397,
+    "Investment_Low": 0.4597,
+    "Speculative": 0.5473,
+    "Distressed": 0.2585
+  },
+  "overfit_verdict": "LIKELY OVERFITTING: train accuracy exceeds test accuracy by 0.3812 (>0.15 threshold). Feature-space reduction, stronger regularization, or fewer boosting rounds are worth trying.",
+  "folds": [
+    {
+      "fold": 1,
+      "n_train": 1623,
+      "n_test": 406,
+      "train_accuracy": 0.8429,
+      "test_accuracy": 0.4951,
+      "train_test_gap": 0.3478,
+      "train_macro_f1": 0.8213,
+      "test_macro_f1": 0.4525,
+      "used_thresholds": true
+    },
+    {
+      "fold": 2,
+      "n_train": 1623,
+      "n_test": 406,
+      "train_accuracy": 0.9082,
+      "test_accuracy": 0.5468,
+      "train_test_gap": 0.3614,
+      "train_macro_f1": 0.8755,
+      "test_macro_f1": 0.4973,
+      "used_thresholds": true
+    },
+    {
+      "fold": 3,
+      "n_train": 1623,
+      "n_test": 406,
+      "train_accuracy": 0.9107,
+      "test_accuracy": 0.4532,
+      "train_test_gap": 0.4575,
+      "train_macro_f1": 0.8722,
+      "test_macro_f1": 0.4177,
+      "used_thresholds": true
+    },
+    {
+      "fold": 4,
+      "n_train": 1623,
+      "n_test": 406,
+      "train_accuracy": 0.8854,
+      "test_accuracy": 0.5394,
+      "train_test_gap": 0.346,
+      "train_macro_f1": 0.8642,
+      "test_macro_f1": 0.4746,
+      "used_thresholds": true
+    },
+    {
+      "fold": 5,
+      "n_train": 1624,
+      "n_test": 405,
+      "train_accuracy": 0.8627,
+      "test_accuracy": 0.4691,
+      "train_test_gap": 0.3935,
+      "train_macro_f1": 0.8425,
+      "test_macro_f1": 0.4144,
+      "used_thresholds": true
+    }
+  ]
+}

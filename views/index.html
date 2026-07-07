@@ -941,7 +941,7 @@
             <div class="cards">
               <section class="analysis-card">
                 <h4>Model performance</h4>
-                <p>Key evaluation metrics for the selected model, plus a short read on the main strength and weakness.</p>
+                <p id="performanceLabel">Key evaluation metrics for the selected model, plus a short read on the main strength and weakness.</p>
                 <div class="grid" id="performanceStats" style="grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;"></div>
                 <div class="mini-card" style="margin-top: 14px;">
                   <h5>Best strength</h5>
@@ -950,6 +950,18 @@
                 <div class="mini-card" style="margin-top: 10px;">
                   <h5>Weakness</h5>
                   <p id="performanceWeakness">Can miss edge cases when companies fall between risk classes.</p>
+                </div>
+
+                <div id="secondaryMetricsSection" style="margin-top: 16px; display: none;">
+                  <details>
+                    <summary style="cursor: pointer; color: var(--muted); font-size: 0.86rem; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;">
+                      Single-split demo (secondary, high variance)
+                    </summary>
+                    <div class="mini-card" style="margin-top: 10px; border-color: rgba(255,159,67,0.35);">
+                      <p id="secondaryMetricsNote" style="color: var(--accent-2); font-weight: 600; margin-bottom: 10px;"></p>
+                      <div class="grid" id="secondaryStats" style="grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;"></div>
+                    </div>
+                  </details>
                 </div>
               </section>
 
