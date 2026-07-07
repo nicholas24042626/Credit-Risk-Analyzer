@@ -368,6 +368,12 @@ def make_split(X, y, groups=None, test_size=0.20, random_state=RANDOM_STATE):
 
     Falls back to stratified ``train_test_split`` when groups are unavailable
     or produce too few members to split, and finally to a plain split.
+
+    Returns ``(X_train, X_test, y_train, y_test, split_strategy, train_groups)``.
+    ``train_groups`` is the ``groups`` array sliced to the training rows (or
+    ``None`` if no groups were provided/used), so callers can perform a further
+    leakage-safe, company-level *nested* split within the training fold (e.g.
+    for threshold tuning) without re-deriving the grouping key.
     """
     if groups is not None:
         try:
@@ -376,10 +382,12 @@ def make_split(X, y, groups=None, test_size=0.20, random_state=RANDOM_STATE):
                 n_splits=n_folds, shuffle=True, random_state=random_state
             )
             train_idx, test_idx = next(sgkf.split(X, y, groups))
+            groups_arr = np.asarray(groups)
             return (
                 X.iloc[train_idx], X.iloc[test_idx],
                 y[train_idx], y[test_idx],
                 "grouped_stratified",
+                groups_arr[train_idx],
             )
         except Exception:
             pass
@@ -388,12 +396,12 @@ def make_split(X, y, groups=None, test_size=0.20, random_state=RANDOM_STATE):
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state, stratify=y
         )
-        return X_train, X_test, y_train, y_test, "stratified"
+        return X_train, X_test, y_train, y_test, "stratified", None
     except ValueError:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=test_size, random_state=random_state
         )
-        return X_train, X_test, y_train, y_test, "random"
+        return X_train, X_test, y_train, y_test, "random", None
 
 
 # ---------------------------------------------------------------------------
