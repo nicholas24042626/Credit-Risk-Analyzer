@@ -30,8 +30,8 @@ Key properties:
   the dashboard can display the CV mean ± std as the primary, authoritative
   accuracy figure without re-running this expensive CV on every request.
 
-Run:  python evaluate_xgboost.py           (uses the default dataset)
-      python evaluate_xgboost.py 5          (override number of folds)
+Run:  python evaluate_xgboost.py           (uses the default dataset, 3 folds ~= 70/30 split)
+      python evaluate_xgboost.py 5          (override number of folds, e.g. 5 folds ~= 80/20 split)
 """
 
 import json
@@ -60,7 +60,14 @@ from preprocessing import (
     group_rating,
     winsorize_features,
 )
-from predict_xgboost import DEFAULT_DATASET_PATH, RESULTS_DIR, fit_thresholds_nested, train_model
+from predict_xgboost import (
+    DEFAULT_DATASET_PATH,
+    RESULTS_DIR,
+    apply_second_stage,
+    fit_thresholds_nested,
+    train_model,
+    train_second_stage_classifier,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -87,10 +94,16 @@ def preprocess_fold(X_train, X_test):
 
 
 def main():
-    n_splits = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+    # Default of 3 folds gives each fold roughly a 67/33 train/test split
+    # (1/3 ~= 0.33), matching the ~70/30 split now used by the dashboard's
+    # single-split path (preprocessing.py's make_split default test_size).
+    # Override via CLI arg, e.g. `python evaluate_xgboost.py 5` for 80/20.
+    n_splits = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 
     df = pd.read_csv(DEFAULT_DATASET_PATH)
     df, _clean_report = clean_dataframe(df)
+    # NOTE: add_temporal_features() was tried here and reverted -- see
+    # docs/XGBoost_Technical_Report.md for the measured (negative) result.
     y_raw = df["Rating"].apply(group_rating)
     mask = y_raw != "Unknown"
     df = df[mask].copy()
@@ -107,10 +120,28 @@ def main():
     fold_records = []
     thresholds_used_count = 0
 
+    # Per-sector breakdown: accumulates (true, predicted) label pairs across
+    # every fold's OUTER TEST predictions only, keyed by raw Sector value.
+    # Motivation: real credit-rating agencies do not apply one global
+    # threshold across sectors (leverage that's normal for a utility can be
+    # alarming for a tech company), so a fair check of this pipeline is
+    # whether accuracy is roughly comparable across sectors or concentrated
+    # in a few. This is a MEASUREMENT only -- it does not change training,
+    # splitting, or the reported headline CV accuracy above. See
+    # docs/XGBoost_Technical_Report.md for the sector-fairness discussion
+    # this was added to investigate.
+    sector_true = {}
+    sector_pred = {}
+
     for i, (tr, te) in enumerate(sgkf.split(X, y, groups), 1):
         X_tr, X_te = X.iloc[tr], X.iloc[te]
         y_tr, y_te = y[tr], y[te]
         groups_tr = groups[tr] if groups is not None else None
+
+        # Capture each test row's raw Sector value BEFORE preprocessing
+        # (preprocess_fold one-hot encodes Sector away). Purely for the
+        # per-sector measurement below; never used as a training signal.
+        sectors_te = X_te["Sector"].to_numpy() if "Sector" in X_te.columns else None
 
         X_tr_enc, X_te_enc = preprocess_fold(X_tr, X_te)
 
@@ -133,6 +164,24 @@ def main():
         proba_tr = ensemble.predict_proba(X_tr_enc)
         preds = (proba_te * thresholds).argmax(axis=1) if use_thresholds else proba_te.argmax(axis=1)
         train_preds = (proba_tr * thresholds).argmax(axis=1) if use_thresholds else proba_tr.argmax(axis=1)
+
+        # Same second-stage Speculative/Distressed correction as the
+        # dashboard (predict_xgboost.py): fit exclusively on this fold's
+        # training data, then applied to both the outer test fold's
+        # predictions and (for the train/test-gap diagnostic) the training
+        # fold's own predictions. Imported directly from predict_xgboost.py
+        # so CV and the dashboard cannot silently diverge (see the
+        # methodological-alignment fix this file's docstring describes).
+        second_stage_model = train_second_stage_classifier(X_tr_enc, y_tr)
+        preds = apply_second_stage(preds, X_te_enc, second_stage_model)
+        train_preds = apply_second_stage(train_preds, X_tr_enc, second_stage_model)
+
+        # Accumulate per-sector (true, predicted) pairs for this fold's test
+        # rows into the running cross-fold collection.
+        if sectors_te is not None:
+            for sec, true_lbl, pred_lbl in zip(sectors_te, y_te, preds):
+                sector_true.setdefault(sec, []).append(int(true_lbl))
+                sector_pred.setdefault(sec, []).append(int(pred_lbl))
 
         acc = accuracy_score(y_te, preds)
         macro = f1_score(y_te, preds, average="macro")
@@ -205,6 +254,70 @@ def main():
 
     per_class_f1_means = {cls: float(np.array(vals).mean()) for cls, vals in per_class_f1.items()}
 
+    # ── Per-sector accuracy/F1 breakdown (measurement only, see note above) ──
+    # Small sectors produce noisy per-sector accuracy estimates the same way
+    # small classes do (§16.13's MIN_SECTOR_GROUP_SIZE rationale applies
+    # here too), so sectors are flagged as "low_support" below a threshold
+    # rather than silently reported alongside well-supported sectors as if
+    # equally reliable.
+    MIN_SECTOR_SUPPORT_FOR_HEADLINE = 20
+    sector_breakdown = []
+    for sec in sorted(sector_true.keys()):
+        y_true_sec = np.array(sector_true[sec])
+        y_pred_sec = np.array(sector_pred[sec])
+        n_sec = len(y_true_sec)
+        sec_acc = float(accuracy_score(y_true_sec, y_pred_sec))
+        sec_macro_f1 = float(f1_score(y_true_sec, y_pred_sec, average="macro", zero_division=0))
+        sector_breakdown.append({
+            "sector": str(sec),
+            "n_test_rows": int(n_sec),
+            "accuracy": round(sec_acc, 4),
+            "macro_f1": round(sec_macro_f1, 4),
+            "low_support": bool(n_sec < MIN_SECTOR_SUPPORT_FOR_HEADLINE),
+        })
+
+    reliable_sectors = [s for s in sector_breakdown if not s["low_support"]]
+    if reliable_sectors:
+        sector_accs_reliable = np.array([s["accuracy"] for s in reliable_sectors])
+        sector_spread = float(sector_accs_reliable.max() - sector_accs_reliable.min())
+        worst_sector = min(reliable_sectors, key=lambda s: s["accuracy"])
+        best_sector = max(reliable_sectors, key=lambda s: s["accuracy"])
+        if sector_spread > 0.30:
+            sector_verdict = (
+                f"LARGE SECTOR DISPARITY: accuracy spread across sectors with >= "
+                f"{MIN_SECTOR_SUPPORT_FOR_HEADLINE} test rows is {sector_spread:.4f} "
+                f"(worst: {worst_sector['sector']} at {worst_sector['accuracy']:.4f}, "
+                f"best: {best_sector['sector']} at {best_sector['accuracy']:.4f}). "
+                f"Sector-conditional thresholds or a sector-interaction feature may be "
+                f"worth investigating for the weaker sector(s)."
+            )
+        elif sector_spread > 0.15:
+            sector_verdict = (
+                f"MODERATE SECTOR DISPARITY: accuracy spread across sectors with >= "
+                f"{MIN_SECTOR_SUPPORT_FOR_HEADLINE} test rows is {sector_spread:.4f} "
+                f"(worst: {worst_sector['sector']} at {worst_sector['accuracy']:.4f}, "
+                f"best: {best_sector['sector']} at {best_sector['accuracy']:.4f}). "
+                f"Present but not dominant; likely within normal sampling variation "
+                f"given ~593 companies split across ~12 sectors."
+            )
+        else:
+            sector_verdict = (
+                f"NO MAJOR SECTOR DISPARITY: accuracy spread across sectors with >= "
+                f"{MIN_SECTOR_SUPPORT_FOR_HEADLINE} test rows is only {sector_spread:.4f} "
+                f"(worst: {worst_sector['sector']} at {worst_sector['accuracy']:.4f}, "
+                f"best: {best_sector['sector']} at {best_sector['accuracy']:.4f}). "
+                f"The existing sector-relative z-score features (compute_sector_stats) "
+                f"appear to be normalising cross-sector differences adequately; "
+                f"sector-conditional thresholds are not evidenced as necessary."
+            )
+    else:
+        sector_spread = None
+        sector_verdict = (
+            f"INSUFFICIENT DATA: no sector had >= {MIN_SECTOR_SUPPORT_FOR_HEADLINE} "
+            f"pooled test rows across all folds; per-sector accuracy cannot be reliably "
+            f"compared."
+        )
+
     lines = [
         f"cv_folds: {n_splits}",
         "split: grouped_stratified (company-level, leakage-safe)",
@@ -228,6 +341,16 @@ def main():
     ]
     for cls in LABEL_ENCODER.classes_:
         lines.append(f"f1_{cls}_mean: {per_class_f1_means[cls]:.4f}")
+
+    lines.append("")
+    lines.append("=== Per-sector breakdown (pooled test predictions across all folds) ===")
+    lines.append(sector_verdict)
+    for s in sorted(sector_breakdown, key=lambda x: x["accuracy"]):
+        flag = " [LOW SUPPORT]" if s["low_support"] else ""
+        lines.append(
+            f"  {s['sector']:<30} n={s['n_test_rows']:>4}  "
+            f"accuracy={s['accuracy']:.4f}  macro_f1={s['macro_f1']:.4f}{flag}"
+        )
 
     output = "\n".join(lines) + "\n"
     (RESULTS_DIR / "xgboost_cv_metrics.txt").write_text(output)
@@ -254,6 +377,9 @@ def main():
         "per_class_f1_mean": {cls: round(v, 4) for cls, v in per_class_f1_means.items()},
         "overfit_verdict": overfit_verdict,
         "folds": fold_records,
+        "sector_breakdown": sector_breakdown,
+        "sector_accuracy_spread": round(sector_spread, 4) if sector_spread is not None else None,
+        "sector_verdict": sector_verdict,
     }
     CV_METRICS_JSON_PATH.write_text(json.dumps(cv_summary, indent=2))
     print(f"CV metrics cached to {CV_METRICS_JSON_PATH}", flush=True)

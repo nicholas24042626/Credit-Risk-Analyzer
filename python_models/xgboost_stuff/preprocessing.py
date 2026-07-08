@@ -120,6 +120,17 @@ _LOG_CANDIDATES = frozenset([
     "fixedAssetTurnover", "companyEquityMultiplier",
 ])
 
+# Ratios for which a per-company trailing trend is computed (see
+# add_temporal_features). Chosen because each is a well-known credit-quality
+# signal where the *direction of travel* (improving vs deteriorating) carries
+# information beyond a single snapshot value: leverage build-up, margin
+# compression, liquidity erosion, and declining asset returns are classic
+# early-warning signs that a static ratio value alone does not capture.
+TEMPORAL_TREND_COLS = frozenset({
+    "debtEquityRatio", "netProfitMargin", "currentRatio", "returnOnAssets",
+    "operatingProfitMargin", "grossProfitMargin", "cashRatio", "debtRatio",
+})
+
 
 # ---------------------------------------------------------------------------
 # Label encoding
@@ -355,10 +366,89 @@ def clean_dataframe(df):
 
 
 # ---------------------------------------------------------------------------
+# Temporal (per-company trend) features — deterministic, pre-split, safe
+# ---------------------------------------------------------------------------
+
+def add_temporal_features(df, trend_cols=TEMPORAL_TREND_COLS):
+    """Add per-company trailing-trend features from each company's own history.
+
+    The dataset averages ~3.4 records per company, but every existing feature
+    treats each company-year row as an independent snapshot -- the model never
+    sees whether a company's leverage is climbing or falling, or whether
+    margins are compressing over time, even though that history is sitting
+    unused in the data. This adds, for each column in ``trend_cols``, a
+    ``{col}_trend`` feature: the change from that company's own PREVIOUS
+    chronological record to the current one (NaN/first record -> 0.0, flagged
+    via ``has_prior_record``).
+
+    Why this is leakage-safe to compute *before* the train/test split (like
+    ``clean_dataframe``, unlike imputation/winsorisation/z-scoring which fit
+    parameters and must run train-only):
+    - No aggregate statistic is fit across companies. Each row's trend value
+      depends ONLY on that same company's own prior row(s).
+    - The train/test split is company-level (``StratifiedGroupKFold`` /
+      ``GroupShuffleSplit`` on Symbol/Name, see ``make_split``): every record
+      for a given company lands entirely on one side of the split. A trend
+      feature computed from company X's own history therefore never uses
+      information from any row that could end up in a *different* split
+      partition -- it is exactly as leakage-safe as looking at a single row's
+      raw ratio value.
+    - No test *labels* are read; only feature columns and the Date column are
+      used to order and difference each company's own rows.
+
+    Degrades gracefully to a no-op (returns ``df`` unchanged) if there is no
+    identifier column (Symbol/Name) or no Date column -- e.g. a user-uploaded
+    dataset that lacks temporal structure -- exactly like the Sector-dependent
+    steps elsewhere in this module degrade when ``Sector`` is absent.
+
+    Returns ``(df_with_trends, report)`` where ``report`` is a small dict for
+    auditing (mirrors the ``clean_dataframe`` convention).
+    """
+    id_col = next((c for c in GROUP_ID_CANDIDATES if c in df.columns), None)
+    if id_col is None or "Date" not in df.columns:
+        return df, {"temporal_features_added": False, "reason": "missing identifier or Date column"}
+
+    parsed_dates = pd.to_datetime(df["Date"], errors="coerce")
+    if parsed_dates.isna().all():
+        return df, {"temporal_features_added": False, "reason": "Date column could not be parsed"}
+
+    available_cols = [c for c in trend_cols if c in df.columns]
+    if not available_cols:
+        return df, {"temporal_features_added": False, "reason": "none of TEMPORAL_TREND_COLS present"}
+
+    out = df.copy()
+    out["_temporal_sort_date"] = parsed_dates
+    # Stable sort: within each company, chronological order; unparsable dates
+    # (NaT) sort last so they never displace a real prior record incorrectly.
+    out = out.sort_values([id_col, "_temporal_sort_date"], kind="stable", na_position="last")
+
+    company_group = out.groupby(id_col)
+    for col in available_cols:
+        prev_val = company_group[col].shift(1)
+        trend = (out[col] - prev_val).clip(-CLIP_BOUND, CLIP_BOUND)
+        out[f"{col}_trend"] = trend.fillna(0.0)
+
+    # 0 for a company's first available record (no prior year to compare
+    # against), 1 otherwise -- lets the model distinguish "genuinely flat
+    # trend" from "no trend information available".
+    out["has_prior_record"] = (out.groupby(id_col).cumcount() > 0).astype(int)
+
+    out = out.drop(columns=["_temporal_sort_date"]).sort_index()
+
+    report = {
+        "temporal_features_added": True,
+        "trend_columns": [f"{c}_trend" for c in available_cols],
+        "rows_with_prior_record": int(out["has_prior_record"].sum()),
+        "rows_total": int(len(out)),
+    }
+    return out, report
+
+
+# ---------------------------------------------------------------------------
 # Train / test split (company-level, leakage-safe)
 # ---------------------------------------------------------------------------
 
-def make_split(X, y, groups=None, test_size=0.20, random_state=RANDOM_STATE):
+def make_split(X, y, groups=None, test_size=0.30, random_state=RANDOM_STATE):
     """Split into train/test, preferring a group-aware stratified split.
 
     When ``groups`` is provided (e.g. company symbol), all records for a given
@@ -533,6 +623,80 @@ def add_interaction_features(X):
         out["cash_leverage"] = safe_div("cashRatio", "debtEquityRatio")
     if {"operatingCashFlowSalesRatio", "netProfitMargin"} <= cols:
         out["cash_quality"] = safe_div("operatingCashFlowSalesRatio", "netProfitMargin")
+
+    # --- Additional credit-risk discriminators ---
+
+    # DuPont decomposition components (ROE = margin * turnover * leverage)
+    if {"netProfitMargin", "assetTurnover", "companyEquityMultiplier"} <= cols:
+        out["dupont_roe"] = (out["netProfitMargin"] * out["assetTurnover"] * out["companyEquityMultiplier"]).clip(-CLIP_BOUND, CLIP_BOUND)
+
+    # Interest coverage proxy: EBIT relative to debt burden
+    if {"ebitPerRevenue", "debtEquityRatio"} <= cols:
+        out["interest_coverage_proxy"] = safe_div("ebitPerRevenue", "debtEquityRatio")
+
+    # Cash-flow adequacy: can the company service debt from operations?
+    if {"operatingCashFlowPerShare", "debtRatio"} <= cols:
+        out["ocf_debt_adequacy"] = (out["operatingCashFlowPerShare"] / (out["debtRatio"] + EPS)).clip(-CLIP_BOUND, CLIP_BOUND)
+
+    # Defensive interval proxy: liquidity relative to burn rate
+    if {"cashRatio", "operatingCashFlowSalesRatio"} <= cols:
+        out["defensive_interval"] = (out["cashRatio"] / (out["operatingCashFlowSalesRatio"].abs() + EPS)).clip(-CLIP_BOUND, CLIP_BOUND)
+
+    # Earnings quality: gap between operating cash flow and reported profit
+    if {"operatingCashFlowSalesRatio", "operatingProfitMargin"} <= cols:
+        out["earnings_quality"] = (out["operatingCashFlowSalesRatio"] - out["operatingProfitMargin"]).clip(-CLIP_BOUND, CLIP_BOUND)
+
+    # FCF yield proxy (FCF per share relative to enterprise value)
+    if {"freeCashFlowPerShare", "enterpriseValueMultiple"} <= cols:
+        out["fcf_yield_proxy"] = safe_div("freeCashFlowPerShare", "enterpriseValueMultiple")
+
+    # Leverage intensity: debt ratio * equity multiplier (compounds leverage signal)
+    if {"debtRatio", "companyEquityMultiplier"} <= cols:
+        out["leverage_intensity"] = (out["debtRatio"] * out["companyEquityMultiplier"]).clip(-CLIP_BOUND, CLIP_BOUND)
+
+    # Gross-to-net margin conversion efficiency (how much of gross profit survives)
+    if {"netProfitMargin", "grossProfitMargin"} <= cols:
+        out["margin_conversion"] = safe_div("netProfitMargin", "grossProfitMargin")
+
+    # Quick ratio minus cash ratio: non-cash current asset component
+    if {"quickRatio", "cashRatio"} <= cols:
+        out["receivables_liquidity"] = (out["quickRatio"] - out["cashRatio"]).clip(-CLIP_BOUND, CLIP_BOUND)
+
+    # Return on debt: how productive is borrowed capital?
+    if {"returnOnAssets", "debtEquityRatio"} <= cols:
+        out["return_on_debt"] = (out["returnOnAssets"] * out["debtEquityRatio"]).clip(-CLIP_BOUND, CLIP_BOUND)
+
+    # Operating efficiency gap: asset turnover vs fixed asset turnover ratio
+    if {"assetTurnover", "fixedAssetTurnover"} <= cols:
+        out["asset_composition_efficiency"] = safe_div("assetTurnover", "fixedAssetTurnover")
+
+    # Altman Z-score proxy (simplified: combines profitability, leverage, liquidity)
+    if {"currentRatio", "returnOnAssets", "debtRatio", "assetTurnover", "ebitPerRevenue"} <= cols:
+        out["altman_z_proxy"] = (
+            1.2 * (out["currentRatio"] - 1.0) +
+            1.4 * out["returnOnAssets"] +
+            3.3 * out["ebitPerRevenue"] +
+            0.6 * (1.0 / (out["debtRatio"] + EPS)).clip(-10, 10) +
+            1.0 * out["assetTurnover"]
+        ).clip(-CLIP_BOUND, CLIP_BOUND)
+
+    # Piotroski-style binary signals (score 0-1 each, sum = composite health)
+    piotroski_components = []
+    if "returnOnAssets" in cols:
+        out["_pio_roa"] = (out["returnOnAssets"] > 0).astype(float)
+        piotroski_components.append("_pio_roa")
+    if "operatingCashFlowSalesRatio" in cols:
+        out["_pio_ocf"] = (out["operatingCashFlowSalesRatio"] > 0).astype(float)
+        piotroski_components.append("_pio_ocf")
+    if {"operatingCashFlowSalesRatio", "returnOnAssets"} <= cols:
+        out["_pio_accrual"] = (out["operatingCashFlowSalesRatio"] > out["returnOnAssets"]).astype(float)
+        piotroski_components.append("_pio_accrual")
+    if "currentRatio" in cols:
+        out["_pio_liquidity"] = (out["currentRatio"] > 1.0).astype(float)
+        piotroski_components.append("_pio_liquidity")
+    if piotroski_components:
+        out["piotroski_score"] = out[piotroski_components].sum(axis=1)
+        out = out.drop(columns=piotroski_components)
 
     # Polynomial interactions for top 3 credit signals
     if {"debtEquityRatio"} <= cols:

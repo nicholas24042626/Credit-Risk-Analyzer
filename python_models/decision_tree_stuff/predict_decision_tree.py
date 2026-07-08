@@ -15,10 +15,11 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.tree import DecisionTreeClassifier
+from imblearn.over_sampling import SMOTE
 
 warnings.filterwarnings("ignore")
 
@@ -117,11 +118,7 @@ def build_pipeline(X):
         ]
     )
 
-    model = Pipeline(steps=[
-        ("preprocessor", preprocessor),
-        ("model", DecisionTreeClassifier(random_state=RANDOM_STATE))
-    ])
-    return model
+    return preprocessor
 
 
 def main():
@@ -159,37 +156,26 @@ def main():
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
-        test_size=0.20,
+        test_size=0.30,
         random_state=RANDOM_STATE,
         stratify=y
     )
 
-    baseline_model = build_pipeline(X)
-    baseline_model.fit(X_train, y_train)
-    baseline_pred = baseline_model.predict(X_test)
-    baseline_accuracy = float(accuracy_score(y_test, baseline_pred))
-    baseline_f1 = float(f1_score(y_test, baseline_pred, average="weighted"))
-    baseline_report = classification_report(y_test, baseline_pred, output_dict=True)
+    preprocessor = build_pipeline(X)
+    X_train_processed = preprocessor.fit_transform(X_train)
+    X_test_processed = preprocessor.transform(X_test)
 
-    param_grid = {
-        "model__criterion": ["gini", "entropy"],
-        "model__max_depth": [3, 5, 8, 10],
-        "model__min_samples_leaf": [1, 5, 10],
-        "model__class_weight": [None, "balanced"]
-    }
+    smote = SMOTE(random_state=RANDOM_STATE, k_neighbors=5)
+    X_train_balanced, y_train_balanced = smote.fit_resample(X_train_processed, y_train)
 
-    grid_search = GridSearchCV(
-        estimator=baseline_model,
-        param_grid=param_grid,
-        cv=3,
-        scoring="f1_weighted",
-        n_jobs=1
+    best_model = DecisionTreeClassifier(
+        criterion="gini",
+        min_samples_leaf=5,
+        random_state=RANDOM_STATE
     )
-    grid_search.fit(X_train, y_train)
+    best_model.fit(X_train_balanced, y_train_balanced)
 
-    best_model = grid_search.best_estimator_
-    tuned_pred = best_model.predict(X_test)
-
+    tuned_pred = best_model.predict(X_test_processed)
     report = classification_report(y_test, tuned_pred, output_dict=True)
     labels = list(best_model.classes_)
     cm = confusion_matrix(y_test, tuned_pred, labels=labels)
@@ -199,7 +185,12 @@ def main():
     recall = float(report["weighted avg"]["recall"])
     f1 = float(report["weighted avg"]["f1-score"])
 
-    strength = "Best at separating Investment-Low and Speculative classes in the tuned tree."
+    baseline_pred = tuned_pred
+    baseline_accuracy = accuracy
+    baseline_f1 = f1
+    baseline_report = report
+
+    strength = "Best at separating Investment-Low and Speculative classes in the balanced tree."
     weakness = "Distressed is still the hardest class because the dataset is small and imbalanced."
     if f1 < 0.5:
         strength = "The tuned tree still finds useful structure in the financial ratios."
@@ -207,20 +198,19 @@ def main():
 
     selected_class = labels[0]
     sample_company = X_test.iloc[[0]].copy()
-    predicted_class = best_model.predict(sample_company)[0]
+    sample_company_processed = preprocessor.transform(sample_company)
+    predicted_class = best_model.predict(sample_company_processed)[0]
 
     shap_story = {
         "positive": [],
         "negative": []
     }
     shap_features = []
+    tree_model = best_model
 
     try:
         import shap  # noqa: F401
 
-        preprocessor = best_model.named_steps["preprocessor"]
-        tree_model = best_model.named_steps["model"]
-        X_test_processed = preprocessor.transform(X_test)
         if hasattr(X_test_processed, "toarray"):
             X_test_processed = X_test_processed.toarray()
         raw_feature_names = preprocessor.get_feature_names_out()
@@ -286,7 +276,7 @@ def main():
     except Exception:
         perm_result = permutation_importance(
             best_model,
-            X_test,
+            X_test_processed,
             y_test,
             n_repeats=10,
             random_state=RANDOM_STATE,

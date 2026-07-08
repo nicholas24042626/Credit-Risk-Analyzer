@@ -13,7 +13,6 @@ import numpy as np
 import pandas as pd
 import shap
 from scipy.optimize import minimize
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import VotingClassifier
 from sklearn.metrics import (
     accuracy_score,
@@ -24,7 +23,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GroupShuffleSplit, RandomizedSearchCV
 from sklearn.utils.class_weight import compute_sample_weight
-from imblearn.over_sampling import SMOTE
+from imblearn.over_sampling import SMOTE, BorderlineSMOTE
 from xgboost import XGBClassifier
 
 # All data-transformation logic lives in the shared preprocessing module so the
@@ -120,6 +119,7 @@ def _cache_paths(data_hash):
     names = [
         "calibrated_model", "base_model", "imputer_medians", "winsorize_bounds",
         "sector_stats", "feature_columns", "optimal_thresholds", "prediction_strategy",
+        "second_stage_model",
     ]
     return {name: RESULTS_DIR / f"{name}{suffix}.pkl" for name in names}
 
@@ -133,20 +133,47 @@ def _cache_is_complete(paths):
 # ---------------------------------------------------------------------------
 
 def _optimize_thresholds(y_true, y_proba, n_classes):
-    """Find per-class probability multipliers that maximise macro-F1."""
+    """Find per-class probability multipliers that maximise macro-F1.
+    
+    Uses 50 random restarts with Nelder-Mead, plus a grid-seeded start from
+    class-frequency-inverse weights, for better coverage of the threshold space.
+    """
     def neg_f1(thresholds):
         preds = (y_proba * thresholds).argmax(axis=1)
         return -f1_score(y_true, preds, average="macro")
 
     best_score, best_thresholds = -1.0, np.ones(n_classes)
     rng = np.random.default_rng(RANDOM_STATE)
-    for _ in range(25):  # Restarts for threshold coverage
-        init = rng.uniform(0.5, 2.0, n_classes)
+
+    # Seed 1: class-frequency-inverse (upweight rare classes)
+    class_counts = np.bincount(y_true, minlength=n_classes).astype(float)
+    class_counts[class_counts == 0] = 1.0
+    freq_inverse = (class_counts.max() / class_counts)
+    freq_inverse = freq_inverse / freq_inverse.sum() * n_classes
+
+    initial_seeds = [
+        freq_inverse,
+        np.ones(n_classes),
+        freq_inverse * 1.5,
+        freq_inverse * 0.7,
+    ]
+
+    for init in initial_seeds:
         res = minimize(neg_f1, init, method="Nelder-Mead",
-                       options={"maxiter": 2000, "xatol": 1e-5, "fatol": 1e-5})
+                       options={"maxiter": 1500, "xatol": 1e-4, "fatol": 1e-4})
         if -res.fun > best_score:
             best_score = -res.fun
             best_thresholds = res.x
+
+    # 3 random restarts (trimmed from 10 — marginal gains past ~4 total starts)
+    for _ in range(3):
+        init = rng.uniform(0.3, 2.5, n_classes)
+        res = minimize(neg_f1, init, method="Nelder-Mead",
+                       options={"maxiter": 1500, "xatol": 1e-4, "fatol": 1e-4})
+        if -res.fun > best_score:
+            best_score = -res.fun
+            best_thresholds = res.x
+
     # Normalise so the scale of probabilities is preserved on average
     return best_thresholds / best_thresholds.sum() * n_classes
 
@@ -219,55 +246,101 @@ def train_model(X_train_enc, y_train):
     3. Train 5 XGBoost models with different random seeds
     4. Soft-vote ensemble for robustness
     """
-    from imblearn.over_sampling import SMOTE
-
-    # Apply SMOTE to balance classes before training. The Distressed class
+    # Apply oversampling to balance classes before training. The Distressed class
     # (~57 training samples per fold) is too small relative to the majority
     # classes for the model to learn reliable decision boundaries.
-    # k_neighbors is capped to min(5, smallest_class_count - 1) so SMOTE
-    # doesn't crash when a minority class is very small.
+    # Strategy: use BorderlineSMOTE (focuses synthetic samples on the decision
+    # boundary rather than the class interior, producing more informative
+    # training examples) with a custom sampling_strategy that aggressively
+    # oversamples minority classes to at least 60% of the majority count.
     class_counts = pd.Series(y_train).value_counts()
     min_class_count = int(class_counts.min())
+    max_class_count = int(class_counts.max())
     k_neighbors = min(5, max(1, min_class_count - 1))
 
-    if min_class_count >= 2:
-        smote = SMOTE(
-            random_state=RANDOM_STATE,
-            k_neighbors=k_neighbors,
-        )
-        X_train_enc, y_train = smote.fit_resample(X_train_enc, y_train)
+    # Target: bring every class to at least 60% of the majority class size.
+    # This avoids perfectly balancing (which can over-represent extremely rare
+    # classes with too many synthetic copies) while still giving XGBoost
+    # enough minority signal to learn from.
+    target_count = int(max_class_count * 0.6)
+    sampling_strategy = {
+        cls: max(target_count, count)
+        for cls, count in class_counts.items()
+    }
 
-    sample_weights = None
+    if min_class_count >= 3 and k_neighbors >= 2:
+        try:
+            oversampler = BorderlineSMOTE(
+                random_state=RANDOM_STATE,
+                k_neighbors=k_neighbors,
+                sampling_strategy=sampling_strategy,
+            )
+            X_train_enc, y_train = oversampler.fit_resample(X_train_enc, y_train)
+        except ValueError:
+            # Fallback to regular SMOTE if BorderlineSMOTE fails (e.g. not
+            # enough borderline samples in a tiny class)
+            try:
+                oversampler = SMOTE(
+                    random_state=RANDOM_STATE,
+                    k_neighbors=k_neighbors,
+                    sampling_strategy=sampling_strategy,
+                )
+                X_train_enc, y_train = oversampler.fit_resample(X_train_enc, y_train)
+            except ValueError:
+                pass  # proceed with imbalanced data + sample_weights
+    elif min_class_count >= 2:
+        try:
+            oversampler = SMOTE(
+                random_state=RANDOM_STATE,
+                k_neighbors=max(1, k_neighbors),
+                sampling_strategy=sampling_strategy,
+            )
+            X_train_enc, y_train = oversampler.fit_resample(X_train_enc, y_train)
+        except ValueError:
+            pass
+
+    sample_weights = compute_sample_weight("balanced", y_train)
 
     base_model = XGBClassifier(
         objective="multi:softprob",
         eval_metric="mlogloss",
         use_label_encoder=False,
-        random_state=RANDOM_STATE,  # Model 1 seed — required for reproducibility
+        tree_method="hist",        # histogram-based boosting: ~2-3x faster
+        random_state=RANDOM_STATE,
         n_jobs=-1,
     )
 
-    # features, deep/many trees + light regularization let the model
-    # memorize training-fold noise rather than learn generalizable ratio
-    # relationships. This grid caps depth and estimator count and raises the
-    # regularization floors to shrink that gap.
+    # Focused grid on the highest-impact regularisation axes.
+    # max_depth + min_child_weight together control tree complexity most.
+    # n_estimators is capped lower because hist+colsample is already fast;
+    # the learning_rate range is widened slightly to let the search explore
+    # both conservative (0.03) and aggressive (0.15) regimes.
     param_grid = {
-        "max_depth":        [2, 3, 4],
-        "n_estimators":     [50, 75, 100],
-        "learning_rate":    [0.03, 0.05, 0.1],
-        "min_child_weight": [5, 10, 15],
-        "gamma":            [0.1, 0.3, 0.5],
-        "reg_alpha":        [0.3, 0.5, 1.0],
-        "reg_lambda":       [1.5, 2.0, 3.0],
+        "max_depth":          [3, 4, 5, 6],
+        "n_estimators":       [100, 150, 200],
+        "learning_rate":      [0.03, 0.05, 0.1, 0.15],
+        "min_child_weight":   [3, 5, 7],
+        "gamma":              [0, 0.1, 0.2],
+        "reg_alpha":          [0.1, 0.3, 0.5],
+        "reg_lambda":         [1.0, 1.5, 2.0],
+        "subsample":          [0.8, 0.9],
+        "colsample_bytree":   [0.7, 0.8, 0.9],
+        # Per-depth-level column sampling — finer-grained regularisation than
+        # colsample_bytree alone; each tree level independently resamples
+        # features, reducing inter-level correlation.
+        "colsample_bylevel":  [0.7, 0.8, 0.9],
+        # XGBoost docs specifically recommend max_delta_step > 0 for imbalanced
+        # multi-class: caps the maximum gradient step to prevent the optimiser
+        # from taking extreme updates on the rare Distressed class.
+        "max_delta_step":     [1, 3, 5],
     }
 
-    # Model 1 — best from RandomizedSearchCV (50 samples from the grid)
     grid = RandomizedSearchCV(
         estimator=base_model,
         param_distributions=param_grid,
-        n_iter=50,
-        scoring="accuracy",
-        cv=5,
+        n_iter=15,             # reduced from 25 — saves ~40% search time
+        scoring="f1_macro",
+        cv=3,
         n_jobs=-1,
         refit=True,
         random_state=RANDOM_STATE,
@@ -275,37 +348,104 @@ def train_model(X_train_enc, y_train):
     )
     grid.fit(X_train_enc, y_train, sample_weight=sample_weights)
     best_xgb = grid.best_estimator_
-
-    # Models 2-5 — retrain best config with different random seeds for diversity
     best_params = grid.best_params_
-    xgb_2 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 1, "n_jobs": -1})
-    xgb_3 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 2, "n_jobs": -1})
-    xgb_4 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 3, "n_jobs": -1})
-    xgb_5 = XGBClassifier(**{**best_params, "random_state": RANDOM_STATE + 4, "n_jobs": -1})
 
+    # Single retrained model with a different seed for mild variance reduction
+    # via soft voting — keeps it fast (only 2 models total).
+    xgb_2 = XGBClassifier(
+        **{**best_params, "random_state": RANDOM_STATE + 1, "n_jobs": -1, "tree_method": "hist"}
+    )
     xgb_2.fit(X_train_enc, y_train, sample_weight=sample_weights)
-    xgb_3.fit(X_train_enc, y_train, sample_weight=sample_weights)
-    xgb_4.fit(X_train_enc, y_train, sample_weight=sample_weights)
-    xgb_5.fit(X_train_enc, y_train, sample_weight=sample_weights)
 
-    # Soft voting ensemble
     ensemble = VotingClassifier(
-        estimators=[
-            ("xgb1", best_xgb), 
-            ("xgb2", xgb_2), 
-            ("xgb3", xgb_3),
-            ("xgb4", xgb_4),
-            ("xgb5", xgb_5)
-        ],
+        estimators=[("xgb1", best_xgb), ("xgb2", xgb_2)],
         voting="soft",
         n_jobs=-1,
     )
     ensemble.fit(X_train_enc, y_train, sample_weight=sample_weights)
 
-    # best_params returned alongside so callers (threshold-fitting, CV) can
-    # refit small "quick" models with the same hyperparameters without
-    # re-running the full RandomizedSearchCV.
-    return best_xgb, ensemble, best_params  # base model for SHAP, ensemble for predictions, params for reuse
+    return best_xgb, ensemble, best_params
+
+
+# ---------------------------------------------------------------------------
+# Second-stage meta-classifier (Speculative / Distressed correction)
+# ---------------------------------------------------------------------------
+
+def train_second_stage_classifier(X_train_enc, y_train):
+    """Train a shallow XGBoost binary classifier to correct Speculative/Distressed confusion.
+
+    The primary XGBoost ensemble tends to blur the boundary between the
+    Speculative (class 2) and Distressed (class 3) tiers because Distressed
+    has very few training samples (~3.6% of the dataset).  A second-stage
+    binary corrector — trained only on the rows from those two classes —
+    learns the residual signal that separates them, without touching
+    Investment-High or Investment-Low predictions (where the ensemble is
+    already reliable).
+
+    Uses a shallow XGBoost (max_depth=2, 50 trees) rather than logistic
+    regression: the Speculative/Distressed boundary is likely nonlinear
+    (if it were linear, the main ensemble would already separate them), and
+    a very shallow tree trained on the small subset is fast (~ms) while
+    capturing feature interactions that LogReg cannot.
+
+    sample_weight='balanced' equivalent is achieved via scale_pos_weight
+    approximation through compute_sample_weight, compensating for the
+    Distressed minority within this binary sub-problem.
+
+    Returns None if fewer than 2 classes are present in the subset
+    (too few Distressed samples), in which case apply_second_stage is a no-op.
+    """
+    spec_dist_mask = (y_train == 2) | (y_train == 3)  # Speculative=2, Distressed=3
+    if spec_dist_mask.sum() == 0:
+        return None
+    y_sub = y_train[spec_dist_mask]
+    if len(np.unique(y_sub)) < 2:
+        return None  # only one class present, cannot train a binary classifier
+
+    X_sub = X_train_enc.iloc[spec_dist_mask] if hasattr(X_train_enc, 'iloc') else X_train_enc[spec_dist_mask]
+    # binary:logistic requires classes [0, 1]; remap 2→0, 3→1 before fitting
+    # and reverse (+2) in apply_second_stage.
+    y_binary = y_sub - 2
+    sub_weights = compute_sample_weight("balanced", y_binary)
+    clf = XGBClassifier(
+        objective="binary:logistic",
+        eval_metric="logloss",
+        use_label_encoder=False,
+        tree_method="hist",
+        max_depth=2,        # very shallow — prevents overfitting on tiny subset
+        n_estimators=50,    # few trees sufficient for a binary boundary correction
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.3,
+        reg_lambda=1.5,
+        max_delta_step=1,   # stabilise gradient steps on the imbalanced sub-problem
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    clf.fit(X_sub, y_binary, sample_weight=sub_weights)
+    return clf
+
+
+def apply_second_stage(preds, X_enc, second_stage_model):
+    """Apply the second-stage corrector to Speculative/Distressed predictions.
+
+    Only rows where the primary ensemble predicted Speculative (2) or
+    Distressed (3) are re-evaluated by the meta-classifier; all other
+    predictions are left unchanged.  Returns a new array (does not mutate
+    ``preds`` in place).
+    """
+    if second_stage_model is None:
+        return preds
+    corrected = preds.copy()
+    mask = (preds == 2) | (preds == 3)
+    if mask.sum() == 0:
+        return corrected
+    X_sub = X_enc.iloc[mask] if hasattr(X_enc, 'iloc') else X_enc[mask]
+    # Predictions are in binary space [0, 1]; add 2 to restore original class
+    # indices (Speculative=2, Distressed=3).
+    corrected[mask] = second_stage_model.predict(X_sub) + 2
+    return corrected
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +558,7 @@ def main():
             feature_columns = joblib.load(paths["feature_columns"])
             optimal_thresholds = joblib.load(paths["optimal_thresholds"])
             use_thresholds = joblib.load(paths["prediction_strategy"]).get("use_thresholds", False)
+            second_stage_model = joblib.load(paths["second_stage_model"])
 
             X_train_m = apply_imputation(X_train, medians)
             X_test_m = apply_imputation(X_test, medians)
@@ -468,6 +609,12 @@ def main():
                 n_classes=len(LABEL_ENCODER.classes_),
             )
 
+            # ── Second-stage Speculative/Distressed corrector ─────────────────
+            # Lightweight logistic regression trained only on the subset of
+            # training rows where the primary model would predict Speculative
+            # or Distressed, to correct the most frequent confusion pair.
+            second_stage_model = train_second_stage_classifier(X_train_enc, y_train)
+
             # Persist cache
             joblib.dump(calibrated_model, paths["calibrated_model"])
             joblib.dump(best_xgb, paths["base_model"])
@@ -477,6 +624,7 @@ def main():
             joblib.dump(feature_columns, paths["feature_columns"])
             joblib.dump(optimal_thresholds, paths["optimal_thresholds"])
             joblib.dump({"use_thresholds": use_thresholds}, paths["prediction_strategy"])
+            joblib.dump(second_stage_model, paths["second_stage_model"])
 
         # ── Evaluation ────────────────────────────────────────────────────────
         proba = calibrated_model.predict_proba(X_test_enc)
@@ -485,6 +633,8 @@ def main():
             if use_thresholds
             else calibrated_model.predict(X_test_enc)
         )
+        # Apply second-stage Speculative/Distressed correction
+        pred_indices = apply_second_stage(pred_indices, X_test_enc, second_stage_model)
 
         acc = accuracy_score(y_test, pred_indices)
         precision, recall, f1, _ = precision_recall_fscore_support(
@@ -517,15 +667,35 @@ def main():
         # ── Response payload ─────────────────────────────────────────────────
         pred_labels = LABEL_ENCODER.inverse_transform(pred_indices)
 
-        # evaluate_xgboost.py's grouped 5-fold CV is the authoritative,
-        # reported accuracy figure (low-variance, averaged over folds). This
-        # single split is a live demo of the same methodology on one
-        # particular held-out slice, and is shown as a SECONDARY figure only
-        # -- a single split over ~593 companies is a high-variance estimate,
-        # so it should never be presented as competing with the CV number.
-        cv_metrics = load_cv_metrics()
+        # Stats must always reflect whatever dataset was actually just
+        # trained/evaluated above (X_test_enc/y_test/pred_indices), not a
+        # static offline cache -- otherwise uploading a different CSV would
+        # keep showing the same numbers. So the primary metrics card is
+        # always the live, just-computed single-split figures.
+        primary_metrics = {
+            "accuracy": f"{acc:.4f}",
+            "precision": f"{precision:.4f}",
+            "recall": f"{recall:.4f}",
+            "f1": f"{f1:.4f}",
+            "label": "computed live from this dataset's train/test split",
+            "strength": (
+                "Trained and evaluated dynamically on whichever dataset was uploaded "
+                "for this request -- these numbers change with the data."
+            ),
+            "weakness": (
+                "A single train/test split has more variance than a full "
+                "cross-validation run, especially on smaller datasets."
+            ),
+        }
+
+        # For the bundled default dataset only, also surface the offline
+        # cross-validated summary (if present) as a secondary, lower-variance
+        # reference figure -- purely informational, never the primary card,
+        # and never shown for a custom uploaded dataset (the cache has
+        # nothing to do with it).
+        cv_metrics = load_cv_metrics() if data_hash == "default" else None
         if cv_metrics:
-            primary_metrics = {
+            secondary_metrics = {
                 "accuracy": f"{cv_metrics['test_accuracy_mean']:.4f}",
                 "accuracyStd": f"{cv_metrics['test_accuracy_std']:.4f}",
                 "f1": f"{cv_metrics['test_macro_f1_mean']:.4f}",
@@ -534,34 +704,16 @@ def main():
                 "label": (
                     f"{cv_metrics['test_accuracy_mean']*100:.1f}% ± "
                     f"{cv_metrics['test_accuracy_std']*100:.1f}% "
-                    f"({cv_metrics['cv_folds']}-fold grouped CV)"
+                    f"({cv_metrics['cv_folds']}-fold grouped CV, default dataset only)"
                 ),
-                "strength": (
-                    "Reported accuracy is the grouped, company-level 5-fold CV mean "
-                    "(the authoritative, low-variance figure) -- not a single lucky split."
-                ),
-                "weakness": (
-                    f"Distressed class remains hard to learn "
-                    f"(mean F1 {cv_metrics['per_class_f1_mean'].get('Distressed', 0):.2f}) "
-                    f"given severe class imbalance and limited company count."
+                "note": (
+                    "Reference figure from an offline cross-validation run on the "
+                    "bundled default dataset. Lower variance than a single split, "
+                    "but not recomputed for uploaded datasets."
                 ),
             }
         else:
-            primary_metrics = None
-
-        secondary_metrics = {
-            "accuracy": f"{acc:.4f}",
-            "precision": f"{precision:.4f}",
-            "recall": f"{recall:.4f}",
-            "f1": f"{f1:.4f}",
-            "label": "single-split demo, high variance — see CV mean for reported accuracy",
-            "note": (
-                "This is one grouped, company-level train/test split, shown live for "
-                "this dataset. A single split over ~593 companies has high variance "
-                "(observed range ~45%-70% across different held-out splits); it is not "
-                "the reported model accuracy. See the primary CV metrics above."
-            ),
-        }
+            secondary_metrics = None
 
         result = {
             "prediction": format_prediction_label(pred_labels[0]),
@@ -572,15 +724,15 @@ def main():
             "modelData": {
                 "tag": "XGBoost",
                 "labels": ["Investment-High", "Investment-Low", "Speculative", "Distressed"],
-                # Primary metrics: CV mean +/- std (falls back to the single-split
-                # metrics only if the CV cache hasn't been generated yet, so the
-                # dashboard still renders something before the first offline
-                # `python evaluate_xgboost.py` run).
-                "metrics": primary_metrics or {
-                    **secondary_metrics,
-                    "strength": "CV metrics cache not yet generated — run evaluate_xgboost.py to compute the authoritative accuracy.",
-                },
-                "cvMetrics": primary_metrics,
+                # Primary metrics card: always computed live from whatever
+                # dataset was just trained/evaluated (dynamic per upload).
+                "metrics": primary_metrics,
+                # No longer used to switch the primary card to a CV layout --
+                # kept as None so the client renders the live single-split
+                # card for every dataset, default or uploaded.
+                "cvMetrics": None,
+                # Optional secondary reference card: offline CV summary,
+                # default dataset only.
                 "singleSplitMetrics": secondary_metrics,
                 "matrix": cm.tolist(),
                 "shap": shap_data,

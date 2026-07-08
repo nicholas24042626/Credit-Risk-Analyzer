@@ -6,6 +6,7 @@ const { spawn } = require("node:child_process");
 const decisionTreeModel = require("./models/decisionTree");
 const randomForestModel = require("./models/randomForest");
 const xgboostModel = require("./models/xgboost");
+const logisticRegressionModel = require("./models/logisticRegression");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 3000);
@@ -62,16 +63,37 @@ function runPythonModel(scriptRelativePath, requestPayload, res) {
     windowsHide: true
   });
 
+  // Guard every stdio pipe. If the Python process failed to actually start
+  // (e.g. "python" isn't resolvable on PATH on this machine), any of these
+  // pipes can emit an 'error' event. Without a listener, that crashes the
+  // entire Node server with an unhandled 'error' event. The pythonProcess
+  // "error"/"close" handlers below already report the failure to the
+  // client, so these listeners just prevent the crash.
   if (pythonProcess.stdin) {
-    pythonProcess.stdin.write(body);
-    pythonProcess.stdin.end();
+    pythonProcess.stdin.on("error", () => {});
+  }
+  if (pythonProcess.stdout) {
+    pythonProcess.stdout.on("error", () => {});
+  }
+  if (pythonProcess.stderr) {
+    pythonProcess.stderr.on("error", () => {});
+  }
+
+  if (pythonProcess.stdin) {
+    try {
+      pythonProcess.stdin.write(body);
+      pythonProcess.stdin.end();
+    } catch (err) {
+      // Writing after the pipe is already broken; the "error"/"close"
+      // handlers below will still fire and report the failure.
+    }
   }
 
   let stdoutData = "";
   let stderrData = "";
   let hasResponded = false;
 
-  // Timeout handler for long-running models (5 minutes)
+  // Timeout handler for long-running models (3 minutes)
   const timeout = setTimeout(() => {
     if (hasResponded) {
       return;
@@ -79,10 +101,10 @@ function runPythonModel(scriptRelativePath, requestPayload, res) {
     hasResponded = true;
     pythonProcess.kill("SIGTERM");
     sendJson(res, 504, {
-      error: "Model training timed out after 5 minutes.",
+      error: "Model training timed out after 3 minutes.",
       details: "Consider using a smaller dataset or pre-training the model offline."
     });
-  }, 5 * 60 * 1000);
+  }, 3 * 60 * 1000);
 
   pythonProcess.stdout.on("data", (data) => {
     stdoutData += data.toString();
@@ -167,6 +189,7 @@ const MODEL_ROUTES = new Map([
   [decisionTreeModel.route, decisionTreeModel.scriptPath],
   [randomForestModel.route, randomForestModel.scriptPath],
   [xgboostModel.route,      xgboostModel.scriptPath],
+  [logisticRegressionModel.route, logisticRegressionModel.scriptPath],
 ]);
 
 const server = http.createServer((req, res) => {

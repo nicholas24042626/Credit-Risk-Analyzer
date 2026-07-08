@@ -56,8 +56,6 @@ function initApp() {
   const secondaryMetricsSection = document.getElementById("secondaryMetricsSection");
   const secondaryMetricsNote = document.getElementById("secondaryMetricsNote");
   const secondaryStats = document.getElementById("secondaryStats");
-  const ratioInputs = document.querySelectorAll("[data-ratio-feature]");
-  const ratioForm = document.getElementById("ratioForm");
   const predictionResult = document.getElementById("predictionResult");
 
   function formatPredictionLabel(label) {
@@ -392,36 +390,11 @@ function initApp() {
 
   function updateActionLabel() {
     const model = getSelectedModel();
-    if (model === "Decision Tree" || model === "Random Forest" || model === "XGBoost") {
+    if (model === "Decision Tree" || model === "Random Forest" || model === "XGBoost" || model === "Logistic Regression") {
       analyzeBtn.textContent = "Train / Predict";
-      ratioForm.style.display = "none";
     } else {
       analyzeBtn.textContent = "Run analysis";
-      ratioForm.style.display = "none";
     }
-  }
-
-  function getRatioPayload() {
-    const payload = {};
-
-    for (const input of ratioInputs) {
-      const fieldName = input.dataset.ratioFeature;
-      if (input.tagName === "SELECT") {
-        if (!input.value) {
-          throw new Error("Sector is required for ratio-based predictions.");
-        }
-        payload[fieldName] = input.value;
-        continue;
-      }
-
-      const value = Number(input.value);
-      if (!Number.isFinite(value)) {
-        throw new Error(`${input.labels[0]?.textContent || input.name} must be a number.`);
-      }
-      payload[fieldName] = value;
-    }
-
-    return payload;
   }
 
   function arrayBufferToBase64(buffer) {
@@ -574,6 +547,53 @@ function initApp() {
     }
   }
 
+  async function predictLogisticRegression() {
+    let payload;
+
+    try {
+      payload = await buildDecisionTreePayload();
+    } catch (error) {
+      predictionResult.textContent = error.message;
+      predictionResult.className = "prediction-result error";
+      return;
+    }
+
+    analyzeBtn.disabled = true;
+    predictionResult.textContent = "Training Logistic Regression on uploaded data...";
+    predictionResult.className = "prediction-result";
+
+    try {
+      const response = await fetch("/predict/logistic-regression", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(getBackendErrorMessage(result, "Logistic Regression prediction failed."));
+      }
+
+      if (result.modelData) {
+        modelData["Logistic Regression"] = result.modelData;
+      }
+
+      predictionResult.textContent = "Model trained and dataset evaluated successfully.";
+      predictionResult.className = "prediction-result success";
+      appState.model = "Logistic Regression";
+      selectedModelTag.textContent = `Model: Logistic Regression · Prediction: ${formatPredictionLabel(result.samplePrediction?.prediction || result.prediction || "Unknown")}`;
+      renderMetrics("Logistic Regression");
+      renderMatrix("Logistic Regression");
+      renderShap("Logistic Regression");
+      showScreen(resultsScreen);
+    } catch (error) {
+      predictionResult.textContent = error.message || "Unable to get a prediction.";
+      predictionResult.className = "prediction-result error";
+    } finally {
+      analyzeBtn.disabled = false;
+    }
+  }
+
   async function predictXgboost() {
     let payload;
 
@@ -663,6 +683,10 @@ function initApp() {
     }
     if (model === "XGBoost") {
       predictXgboost();
+      return;
+    }
+    if (model === "Logistic Regression") {
+      predictLogisticRegression();
       return;
     }
     if (!appState.uploaded) return;
