@@ -56,8 +56,6 @@ function initApp() {
   const secondaryMetricsSection = document.getElementById("secondaryMetricsSection");
   const secondaryMetricsNote = document.getElementById("secondaryMetricsNote");
   const secondaryStats = document.getElementById("secondaryStats");
-  const ratioInputs = document.querySelectorAll("[data-ratio-feature]");
-  const ratioForm = document.getElementById("ratioForm");
   const predictionResult = document.getElementById("predictionResult");
 
   function formatPredictionLabel(label) {
@@ -394,34 +392,9 @@ function initApp() {
     const model = getSelectedModel();
     if (model === "Decision Tree" || model === "Random Forest" || model === "XGBoost" || model === "Logistic Regression") {
       analyzeBtn.textContent = "Train / Predict";
-      ratioForm.style.display = "none";
     } else {
       analyzeBtn.textContent = "Run analysis";
-      ratioForm.style.display = "none";
     }
-  }
-
-  function getRatioPayload() {
-    const payload = {};
-
-    for (const input of ratioInputs) {
-      const fieldName = input.dataset.ratioFeature;
-      if (input.tagName === "SELECT") {
-        if (!input.value) {
-          throw new Error("Sector is required for ratio-based predictions.");
-        }
-        payload[fieldName] = input.value;
-        continue;
-      }
-
-      const value = Number(input.value);
-      if (!Number.isFinite(value)) {
-        throw new Error(`${input.labels[0]?.textContent || input.name} must be a number.`);
-      }
-      payload[fieldName] = value;
-    }
-
-    return payload;
   }
 
   function arrayBufferToBase64(buffer) {

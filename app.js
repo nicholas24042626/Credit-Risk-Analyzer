@@ -93,7 +93,7 @@ function runPythonModel(scriptRelativePath, requestPayload, res) {
   let stderrData = "";
   let hasResponded = false;
 
-  // Timeout handler for long-running models (5 minutes)
+  // Timeout handler for long-running models (3 minutes)
   const timeout = setTimeout(() => {
     if (hasResponded) {
       return;
@@ -101,10 +101,10 @@ function runPythonModel(scriptRelativePath, requestPayload, res) {
     hasResponded = true;
     pythonProcess.kill("SIGTERM");
     sendJson(res, 504, {
-      error: "Model training timed out after 5 minutes.",
+      error: "Model training timed out after 3 minutes.",
       details: "Consider using a smaller dataset or pre-training the model offline."
     });
-  }, 5 * 60 * 1000);
+  }, 3 * 60 * 1000);
 
   pythonProcess.stdout.on("data", (data) => {
     stdoutData += data.toString();
