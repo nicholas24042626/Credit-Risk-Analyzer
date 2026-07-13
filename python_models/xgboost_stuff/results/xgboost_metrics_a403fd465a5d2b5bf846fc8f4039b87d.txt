@@ -1,4 +1,0 @@
-split_strategy: grouped_stratified
-test_samples: 406
-accuracy: 0.5123
-f1_macro: 0.4403
