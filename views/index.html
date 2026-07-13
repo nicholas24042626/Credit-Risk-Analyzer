@@ -921,6 +921,22 @@
                     </div>
                   </details>
                 </div>
+
+                <div id="fairBaselineSection" style="margin-top: 16px; display: none;">
+                  <details>
+                    <summary style="cursor: pointer; color: var(--muted); font-size: 0.86rem; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;">
+                      Fair cross-model baseline
+                    </summary>
+                    <div class="mini-card" style="margin-top: 10px; border-color: rgba(94,180,255,0.35);">
+                      <p style="color: var(--muted); margin-bottom: 10px;">
+                        Same cleaning, company-level split, engineered features, and untuned default
+                        settings as the other three models — directly comparable across models, unlike
+                        the tuned metrics above.
+                      </p>
+                      <div class="grid" id="fairBaselineStats" style="grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;"></div>
+                    </div>
+                  </details>
+                </div>
               </section>
 
               <section class="analysis-card">

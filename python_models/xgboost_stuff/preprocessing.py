@@ -3,22 +3,44 @@
 This module centralises every data-transformation step so the production
 inference script (``predict_xgboost.py``) and the training notebook can import
 the exact same logic instead of duplicating it (which is how the two drift out
-of sync).
+of sync). This module is XGBoost-only: the Decision Tree, Random Forest, and
+Logistic Regression models each own a separate preprocessing implementation
+(confirmed by grep -- nothing outside ``xgboost_stuff/`` imports this file), so
+everything below is free to be tree-specific without any cross-model
+coordination.
 
 Pipeline order — MUST be preserved:
 
-    grouped stratified split          (leakage-safe, company-level)
-        -> median imputation          (fit on train only)
-        -> winsorization (P1-P99)     (fit on train only)
-        -> interaction / log features (deterministic formulas)
-        -> sector z-scores            (fit on train only)
-        -> one-hot encode + align     (all categoricals, not just Sector)
-        -> feature selection          (fit on train only)
+    grouped stratified split           (leakage-safe, company-level)
+        -> missingness indicators      (fit on train only; NaN passed through,
+                                         NOT imputed -- XGBoost splits on
+                                         missingness natively)
+        -> interaction / log features  (deterministic formulas)
+        -> sector z-scores             (fit on train only -- an engineered
+                                         relative-position FEATURE, not a
+                                         StandardScaler-style global rescale)
+        -> categorical dtype cast      (fit on train only; native pandas
+                                         'category' dtype for enable_categorical,
+                                         NOT one-hot)
+        -> feature selection           (fit on train only; near-zero-variance
+                                         only -- no correlation/VIF pruning)
 
-Every fitted parameter (medians, winsorize bounds, sector stats, feature
-columns, selected features) is computed exclusively on the training fold and
-then applied identically to the test fold and to inference inputs. This is what
-keeps the pipeline free of preprocessing/feature-engineering leakage.
+Every fitted parameter (missingness-indicator columns, sector stats,
+categorical vocab, selected features) is computed exclusively on the training
+fold and then applied identically to the test fold and to inference inputs.
+This is what keeps the pipeline free of preprocessing/feature-engineering
+leakage.
+
+Deliberately NOT in this pipeline (tree-based model, not a distance/gradient
+model -- see each function's docstring for the one-line reason): median/mean
+imputation, winsorisation/outlier clipping, StandardScaler/MinMaxScaler,
+Yeo-Johnson or any other power transform, and correlation/VIF-based feature
+dropping. None of the scaler/power-transform steps were ever present in this
+file to begin with (confirmed by grep across predict_xgboost.py,
+evaluate_xgboost.py, and this file) -- imputation, winsorisation, and
+correlation-based pruning WERE present and have been removed; see
+``fit_imputation``/``winsorize_features``/``fit_feature_selection`` below for
+what changed and why.
 """
 
 import re
@@ -46,9 +68,10 @@ CLIP_BOUND = 1e6
 WINSOR_LOWER_PCT = 1
 WINSOR_UPPER_PCT = 99
 
-# Feature-selection thresholds.
+# Feature-selection threshold. (A HIGH_CORR_THRESHOLD constant used to live
+# here for correlation/VIF-based pruning; removed along with that pruning
+# step -- see fit_feature_selection's docstring for why it's tree-inappropriate.)
 NEAR_ZERO_VAR_THRESHOLD = 1e-8   # drop columns with essentially no variance
-HIGH_CORR_THRESHOLD = 0.98       # drop one of any pair correlated above this
 
 # Number of folds used to carve out the held-out test set (1/N ~= test size).
 SPLIT_N_FOLDS = 5
@@ -495,8 +518,17 @@ def make_split(X, y, groups=None, test_size=0.30, random_state=RANDOM_STATE):
 
 
 # ---------------------------------------------------------------------------
-# Missing-value imputation (fit on train only)
+# DEPRECATED — median imputation (NOT called by the active XGBoost pipeline)
 # ---------------------------------------------------------------------------
+#
+# Why removed: imputation exists to give distance-based/linear models
+# (KNN, SVM, logistic regression) a complete numeric matrix to compute on.
+# XGBoost's split-finding algorithm natively learns a default branch direction
+# for missing values at every node (see ``enable_categorical``/missing-value
+# handling in the XGBoost docs), so filling NaN with a median throws away the
+# "this value was unknown" signal and replaces it with a fabricated data
+# point that can bias split thresholds. Left defined (unused) for the same
+# historical-record convention as ``add_temporal_features``.
 
 def fit_imputation(X_train):
     """Return per-column medians for numeric features (training set only)."""
@@ -517,8 +549,54 @@ def apply_imputation(X, medians):
 
 
 # ---------------------------------------------------------------------------
-# Winsorization (outlier capping)
+# Missingness indicators (fit on train only) — the tree-native replacement
+# for imputation: NaN passes through untouched for XGBoost's native missing-
+# value split handling; a companion binary flag captures "was this value
+# missing" as its own feature in case missingness itself is informative
+# (e.g. a smaller/newer filer omitting a disclosure-heavy ratio).
 # ---------------------------------------------------------------------------
+
+def fit_missingness_indicators(X_train):
+    """Return the numeric columns that have >=1 NaN in the training fold.
+
+    Fit on train only: which columns get an ``_is_missing`` flag is decided
+    from the training fold's missingness pattern; the identical column list
+    is then applied to test/inference data (leakage-safe, same fit/apply
+    convention as the old ``fit_imputation``).
+    """
+    numerics = X_train.select_dtypes(include="number").columns
+    return [c for c in numerics if X_train[c].isna().any()]
+
+
+def apply_missingness_indicators(X, indicator_cols):
+    """Add one binary ``{col}_is_missing`` column per fitted indicator column.
+
+    Each flag's value is read directly off the row's own NaN pattern (not a
+    fitted statistic), so this is safe to call on train, test, or arbitrary
+    inference input — only the *set* of columns to flag was fit on train.
+    The original column is left untouched (still NaN where missing).
+    """
+    X_out = X.copy()
+    for col in indicator_cols:
+        if col in X_out.columns:
+            X_out[f"{col}_is_missing"] = X_out[col].isna().astype(int)
+    return X_out
+
+
+# ---------------------------------------------------------------------------
+# DEPRECATED — winsorisation / outlier clipping (NOT called by the active
+# XGBoost pipeline)
+# ---------------------------------------------------------------------------
+#
+# Why removed: winsorisation exists to stop extreme values from dominating a
+# distance metric or a gradient step in linear/kernel models. A tree split
+# only ever asks "is this value <= threshold?" — an outlier just becomes its
+# own bucket at one end of a split and cannot inflate a coefficient or a
+# Euclidean distance the way it would for logistic regression, SVM, or KNN.
+# Clipping a genuine extreme ratio (e.g. a company mid-distress with a
+# currentRatio near zero) can actively destroy the exact signal that
+# distinguishes the Distressed class. Left defined (unused) for the same
+# historical-record convention as ``add_temporal_features``.
 
 def winsorize_features(X_train, X_test, lower_pct=WINSOR_LOWER_PCT, upper_pct=WINSOR_UPPER_PCT):
     """Clip numeric columns to [lower_pct, upper_pct] percentiles from training data.
@@ -680,21 +758,32 @@ def add_interaction_features(X):
             1.0 * out["assetTurnover"]
         ).clip(-CLIP_BOUND, CLIP_BOUND)
 
-    # Piotroski-style binary signals (score 0-1 each, sum = composite health)
+    # Piotroski-style binary signals (score 0-1 each, sum = composite health).
+    # NOTE: since imputation was removed (§ preprocessing.py module docstring),
+    # these columns can now genuinely contain NaN at this point. A plain `>`
+    # comparison on NaN silently evaluates to False in pandas rather than
+    # propagating NaN, which would misrepresent "unknown ROA" as "ROA <= 0" —
+    # `.where(<source>.notna())` restores NaN wherever the source was missing,
+    # so XGBoost still sees these as genuinely missing rather than a fabricated
+    # negative signal.
     piotroski_components = []
     if "returnOnAssets" in cols:
-        out["_pio_roa"] = (out["returnOnAssets"] > 0).astype(float)
+        out["_pio_roa"] = (out["returnOnAssets"] > 0).astype(float).where(out["returnOnAssets"].notna())
         piotroski_components.append("_pio_roa")
     if "operatingCashFlowSalesRatio" in cols:
-        out["_pio_ocf"] = (out["operatingCashFlowSalesRatio"] > 0).astype(float)
+        out["_pio_ocf"] = (out["operatingCashFlowSalesRatio"] > 0).astype(float).where(out["operatingCashFlowSalesRatio"].notna())
         piotroski_components.append("_pio_ocf")
     if {"operatingCashFlowSalesRatio", "returnOnAssets"} <= cols:
-        out["_pio_accrual"] = (out["operatingCashFlowSalesRatio"] > out["returnOnAssets"]).astype(float)
+        both_present = out["operatingCashFlowSalesRatio"].notna() & out["returnOnAssets"].notna()
+        out["_pio_accrual"] = (out["operatingCashFlowSalesRatio"] > out["returnOnAssets"]).astype(float).where(both_present)
         piotroski_components.append("_pio_accrual")
     if "currentRatio" in cols:
-        out["_pio_liquidity"] = (out["currentRatio"] > 1.0).astype(float)
+        out["_pio_liquidity"] = (out["currentRatio"] > 1.0).astype(float).where(out["currentRatio"].notna())
         piotroski_components.append("_pio_liquidity")
     if piotroski_components:
+        # .sum(axis=1) skips NaN components by default (a row missing one
+        # input still gets a partial score from the rest, rather than a fully
+        # NaN composite) -- a deliberate, documented trade-off, not an oversight.
         out["piotroski_score"] = out[piotroski_components].sum(axis=1)
         out = out.drop(columns=piotroski_components)
 
@@ -705,6 +794,36 @@ def add_interaction_features(X):
         out["returnOnAssets_sq"] = (out["returnOnAssets"] ** 2).clip(-CLIP_BOUND, CLIP_BOUND)
     if {"currentRatio"} <= cols:
         out["currentRatio_sq"] = (out["currentRatio"] ** 2).clip(-CLIP_BOUND, CLIP_BOUND)
+
+    # --- XGBoost-specific explicit interactions (this preprocessing pass) ---
+    #
+    # Candidate ratios scanned from the 25 KNOWN_NUMERIC_FEATURE_COLS before
+    # adding anything new: leverage {debtEquityRatio, debtRatio,
+    # companyEquityMultiplier}, liquidity {currentRatio, quickRatio,
+    # cashRatio}, earnings power {ebitPerRevenue -- the closest available
+    # proxy; the schema has no raw EBITDA or interest-expense column, so a
+    # literal debt/EBITDA or classic interest-coverage ratio cannot be
+    # computed}, cash coverage {operatingCashFlowPerShare,
+    # freeCashFlowPerShare, operatingCashFlowSalesRatio}. Most pairwise
+    # combinations of these are already covered above (leverage_coverage,
+    # cashflow_debt_coverage, interest_coverage_proxy, liquidity_leverage,
+    # debt_service_ratio, ocf_debt_adequacy, leverage_intensity, dupont_roe,
+    # altman_z_proxy). Two genuinely new ones follow:
+    if {"debtEquityRatio", "currentRatio"} <= cols:
+        # Compound distress signal: leverage x illiquidity, MULTIPLICATIVE
+        # rather than a quotient like the existing liquidity_leverage. A tree
+        # needs a conjunction of two separate splits (one per feature) to
+        # approximate "simultaneously high leverage AND low liquidity"; this
+        # feature hands that joint condition to the model directly instead of
+        # relying on tree depth to reconstruct it.
+        out["leverage_liquidity_stress"] = (
+            out["debtEquityRatio"] * (1.0 / (out["currentRatio"] + EPS))
+        ).clip(-CLIP_BOUND, CLIP_BOUND)
+    if {"debtRatio", "ebitPerRevenue"} <= cols:
+        # Debt-to-earnings-power proxy (debt/EBITDA is not computable: no
+        # EBITDA or interest-expense column exists in this schema).
+        # ebitPerRevenue is the nearest available earnings-power measure.
+        out["debt_to_earnings_power"] = safe_div("debtRatio", "ebitPerRevenue")
 
     # Log transforms (sign-preserving)
     for col in _LOG_CANDIDATES & cols:
@@ -787,46 +906,90 @@ def apply_zscore_from_stats(df_list, stats):
 
 
 # ---------------------------------------------------------------------------
-# Encoding + alignment (all categoricals, not just Sector)
+# Categorical dtype casting (fit on train only) — replaces one-hot encoding
 # ---------------------------------------------------------------------------
 
-def encode_and_align(X_train_z, X_test_z, feature_columns=None):
-    """One-hot encode every categorical column and align train/test columns.
+def fit_categorical_dtypes(X_train):
+    """Return ``{column: [categories...]}`` for every object/category column,
+    fit on the training fold's observed values only.
 
-    Previously only ``Sector`` was encoded, so any other string/object column
-    that survived the drop step would leak into the model matrix as a raw
-    object dtype and break XGBoost. This detects all object/category columns
-    dynamically and encodes them generically.
+    Leakage discipline: a category value that appears only in the test fold
+    is NOT in this train-fit vocabulary, so ``apply_categorical_dtypes`` maps
+    it to NaN — exactly the same "unseen at fit time" behaviour any encoder
+    fit on train would have, and XGBoost's native missing-value handling
+    covers it the same way it covers any other NaN (no separate imputation
+    needed).
     """
-    train_cats = X_train_z.select_dtypes(include=["object", "category"]).columns.tolist()
-    test_cats = X_test_z.select_dtypes(include=["object", "category"]).columns.tolist()
+    cat_cols = X_train.select_dtypes(include=["object", "category"]).columns
+    return {col: sorted(X_train[col].dropna().unique().tolist()) for col in cat_cols}
 
-    X_train_enc = pd.get_dummies(X_train_z, columns=train_cats)
-    X_test_enc = pd.get_dummies(X_test_z, columns=test_cats)
 
+def apply_categorical_dtypes(X, categories):
+    """Cast each fitted column to pandas 'category' dtype using the train-fit
+    category list, for use with ``XGBClassifier(enable_categorical=True)``.
+
+    Ordinal/label encoding was considered (reusing ``ExplicitLabelEncoder``)
+    but rejected for ``Sector``: sectors have no natural order, and an
+    arbitrary integer code (e.g. Energy=0, Finance=1, ...) would let the tree
+    split on "Sector code <= 3" as if the categories were ranked, imposing a
+    false ordinal relationship native categorical splits avoid entirely.
+    """
+    X_out = X.copy()
+    for col, cats in categories.items():
+        if col in X_out.columns:
+            X_out[col] = pd.Categorical(X_out[col], categories=cats)
+    return X_out
+
+
+# ---------------------------------------------------------------------------
+# Column alignment (no one-hot expansion — categorical dtype is preserved)
+# ---------------------------------------------------------------------------
+
+def align_features(X_train_cat, X_test_cat, feature_columns=None):
+    """Align train/test columns without one-hot encoding.
+
+    Replaces the old ``encode_and_align`` (which called ``pd.get_dummies``).
+    Categorical columns are expected to already be pandas 'category' dtype
+    (see ``fit_categorical_dtypes``/``apply_categorical_dtypes``) so
+    XGBoost's native categorical split support can use them directly — no
+    dummy-column explosion, so SHAP attributes importance to one feature per
+    category column instead of N one-hot dummies, and no scaler/encoder step
+    obscures a ratio's original meaning in a SHAP plot.
+
+    Missing columns are filled with NaN (not 0): under the no-imputation
+    policy, a column that couldn't be computed on a given input is genuinely
+    unknown, and NaN lets XGBoost's native missing-value handling treat it
+    that way instead of silently asserting a specific value.
+    """
     if feature_columns is not None:
-        X_train_enc = X_train_enc.reindex(columns=feature_columns, fill_value=0)
-        X_test_enc = X_test_enc.reindex(columns=feature_columns, fill_value=0)
+        X_train_out = X_train_cat.reindex(columns=feature_columns)
+        X_test_out = X_test_cat.reindex(columns=feature_columns)
     else:
-        X_train_enc, X_test_enc = X_train_enc.align(X_test_enc, join="left", axis=1, fill_value=0)
-
-    return X_train_enc, X_test_enc
+        X_train_out, X_test_out = X_train_cat.align(X_test_cat, join="left", axis=1)
+    return X_train_out, X_test_out
 
 
 # ---------------------------------------------------------------------------
 # Feature selection (fit on train only)
 # ---------------------------------------------------------------------------
 
-def fit_feature_selection(
-    X_train_enc,
-    var_threshold=NEAR_ZERO_VAR_THRESHOLD,
-    corr_threshold=HIGH_CORR_THRESHOLD,
-):
+def fit_feature_selection(X_train_enc, var_threshold=NEAR_ZERO_VAR_THRESHOLD):
     """Return the list of columns to keep after pruning the feature space.
 
-    1. Drop near-zero-variance columns (no discriminative signal).
-    2. Drop one column from every highly-correlated pair (|r| > corr_threshold)
-       to reduce redundancy and overfitting risk on the ~130-feature space.
+    Drops near-zero-variance numeric columns (no discriminative signal).
+    Categorical ('category' dtype) columns are always retained regardless of
+    this check — pandas' variance computation only covers numeric dtypes, so
+    naively including them would have silently dropped every categorical
+    column as "zero variance".
+
+    The correlation/VIF-style pruning step (dropping one column from every
+    highly-correlated pair) that used to live here has been REMOVED: that
+    concern belongs to linear/distance models, whose coefficients or distance
+    metrics become unstable under collinearity. A tree split only ever
+    consumes one feature at a time — correlated predictors simply compete for
+    split gain (the tree picks whichever one splits better at that node) and
+    do not destabilise the model, so dropping a correlated feature can only
+    ever throw away information a tree could otherwise have used.
 
     Selection statistics are computed on the training matrix only. Falls back
     to the full column set if pruning would remove everything.
@@ -835,19 +998,17 @@ def fit_feature_selection(
     if not columns:
         return columns
 
-    # 1. Near-zero variance
-    variances = X_train_enc.var(axis=0, numeric_only=True)
-    keep = [c for c in columns if float(variances.get(c, 0.0)) > var_threshold]
-    if not keep:
+    numeric_cols = X_train_enc.select_dtypes(include="number").columns
+    categorical_cols = [c for c in columns if c not in set(numeric_cols)]
+
+    variances = X_train_enc[numeric_cols].var(axis=0)
+    keep_numeric = [c for c in numeric_cols if float(variances.get(c, 0.0)) > var_threshold]
+
+    selected = set(keep_numeric) | set(categorical_cols)
+    if not selected:
         return columns
-
-    # 2. High correlation — drop the later column of each correlated pair
-    corr = X_train_enc[keep].corr().abs()
-    upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
-    to_drop = {col for col in upper.columns if (upper[col] > corr_threshold).any()}
-    selected = [c for c in keep if c not in to_drop]
-
-    return selected or keep
+    # Preserve original column order.
+    return [c for c in columns if c in selected]
 
 
 def extract_groups(df):

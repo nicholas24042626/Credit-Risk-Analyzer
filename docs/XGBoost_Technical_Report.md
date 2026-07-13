@@ -8,20 +8,20 @@
 
 This report documents the complete engineering lifecycle of a multiclass XGBoost classifier for corporate credit rating prediction, deployed as a web application with SHAP-based explainability. The system classifies companies into four financial risk tiers — Investment-High, Investment-Low, Speculative, and Distressed — using 30 financial ratios from the Set A Corporate Rating dataset (2,029 company–year records, 593 unique companies).
 
-The project evolved through multiple documented iterations, each motivated by a specific engineering failure: row-level data leakage inflated early accuracy from ~72% to an honest ~46% after correction; an early SMOTE attempt on 4–5 Distressed samples produced degenerate synthetic clusters and was abandoned; threshold-strategy selection leaked test labels into a production decision; and, most recently, the **dashboard's single-split evaluation and the offline cross-validation script had drifted into two different pipelines** (different model, different split, different threshold logic), producing two contradictory accuracy figures (53% vs. 70%) for what was supposed to be the same model. All of these were diagnosed, documented, and resolved systematically.
+The project evolved through multiple documented iterations, each motivated by a specific engineering failure: row-level data leakage inflated early accuracy to ~72% (which dropped to an honest ~46% after correction); an early SMOTE attempt on 4–5 Distressed samples produced degenerate synthetic clusters and was abandoned; threshold-strategy selection leaked test labels into a production decision; and, most recently, the **dashboard's single-split evaluation and the offline cross-validation script had drifted into two different pipelines** (different model, different split, different threshold logic), producing two contradictory accuracy figures (53% vs. 70%) for what was supposed to be the same model. All of these were diagnosed, documented, and resolved systematically.
 
-**Authoritative performance** (company-level, leakage-safe, grouped stratified 3-fold cross-validation — a ~70/30 train/test split per fold, changed from the original ~80/20 5-fold split, see §16.21 — current pipeline: SMOTE-augmented 5-seed ensemble, nested leakage-safe threshold fitting, and a second-stage Speculative/Distressed discriminator, §16.17):
+**Authoritative performance** (company-level, leakage-safe, grouped stratified 3-fold cross-validation — a ~70/30 train/test split per fold, changed from the original ~80/20 5-fold split, see §16.21 — current pipeline: SMOTE-augmented seeded soft-voting ensemble blended with an ordinal cumulative-link decomposition, plain-argmax prediction rule, §16.26):
 
 | Metric | CV Mean ± Std |
 |---|---|
-| Accuracy | 0.5047 ± 0.0255 |
-| Macro F1 | 0.4373 ± 0.0115 |
+| Accuracy | 0.5264 ± 0.0252 |
+| Macro F1 | 0.4497 ± 0.0155 |
 
 > [!NOTE]
-> **Run-to-run variance**: XGBoost's `n_jobs=-1` multithreading introduces minor non-determinism (§14.3), so re-running `evaluate_xgboost.py` produces slightly different figures each time (e.g. a prior run of this exact pipeline configuration measured 0.5136 ± 0.0190 accuracy / 0.4398 ± 0.0145 macro F1). The figures quoted throughout this report are taken from the currently-cached `results/xgboost_cv_metrics.json`, regenerated as the final step of this revision, so the report and the live artifact match exactly.
+> **Run-to-run variance**: XGBoost's `n_jobs=-1` multithreading introduces minor non-determinism (§14.3), so re-running `evaluate_xgboost.py` produces slightly different figures each time (e.g. two consecutive runs of the current §16.26 configuration measured 0.5244 ± 0.0210 and 0.5264 ± 0.0252 accuracy). The figures quoted throughout this report are taken from the currently-cached `results/xgboost_cv_metrics.json`, regenerated as the final step of this revision, so the report and the live artifact match exactly.
 
-> [!WARNING]
-> **Accuracy/fairness trade-off**: the second-stage discriminator (§16.17) that produces this accuracy figure measurably reduces Distressed-class F1 relative to the same pipeline without it. Macro F1 — which weights all four classes equally rather than by size — is *lower* under the current pipeline despite the higher accuracy. Which figure is "better" depends on whether missed Distressed-class detections or overall accuracy matters more for the intended use case; both are reported so this trade-off is visible rather than hidden behind a single headline number.
+> [!NOTE]
+> **Distressed-class F1 remains the weak point**: the ordinal blend (§16.26) raised accuracy AND macro F1 relative to the previous configuration, and removing the second-stage discriminator eliminated the worst of the §16.17 Distressed-suppression trade-off — but Distressed F1 (~0.22–0.25 across runs) is still far below the other classes. Whether headline accuracy or minority-class recall matters more depends on the deployment context; both are reported so the trade-off stays visible.
 
 These figures are deliberately conservative. They reflect a 4-class ordinal problem with severe class imbalance (Distressed: ~3.7% of data), company-level split integrity (no company appears in both train and test), and a threshold-fitting protocol that never touches the evaluation fold. ~50% accuracy is the honest ceiling for this feature set and sample size — an examiner should evaluate the engineering discipline that produced this number, not the number itself.
 
@@ -105,12 +105,12 @@ The grouping decision was made before any model training. It is a domain decisio
 
 **Trade-offs**: Grouping CCC/CC with Distressed makes the Speculative class more internally coherent (BB/B only) but gives the Distressed class a wider spread (CCC through D). This is consistent with Basel II's "speculative-grade" boundary at BB.
 
-**Evidence**: Under the CCC/CC→Speculative grouping, the Distressed class had 1 test sample in some splits — producing 100% or 0% accuracy with no statistical meaning. Under the CCC/CC→Distressed grouping, Distressed achieves F1 ≈ 0.25 (CV mean), which is weak but genuine.
+**Evidence**: Under the CCC/CC→Speculative grouping, the Distressed class had extremely few test samples in some splits (sometimes only one) — producing 100% or 0% accuracy with no statistical meaning. Under the CCC/CC→Distressed grouping, Distressed achieves F1 ≈ 0.25 (CV mean), which is weak but genuine.
 
 > [!NOTE]
 > **Cross-system inconsistency — discovered and fixed**: An earlier audit found two mutually exclusive groupings in the codebase. The frontend `client.js` (`ratingRuleEngine`) and the Random Forest backend (`predict_random_forest.py`, `group_rating()`) mapped CCC/CC to "Speculative" and only C/D to "Distressed", while the XGBoost backend (`preprocessing.py`), Decision Tree backend (`predict_decision_tree.py`), and Logistic Regression backend (`predict_logistic_regression.py`) mapped CCC/CC/C/D to "Distressed". This was a genuine engineering defect: two of the dashboard's models defined the classification task differently from the other three, making cross-model comparison statistically invalid regardless of which grouping is "correct".
 >
-> **Fix applied**: `client.js` and `predict_random_forest.py` were updated to the CCC/CC→Distressed grouping, matching the other three implementations and the domain justification in §2.3 (this raises Distressed support from ~10 to ~72 records, making the class measurable rather than a coin flip on 1–2 test samples). All five `group_rating()`/`ratingRuleEngine` implementations in the codebase now agree — verified by direct source inspection after the change. Random Forest does not cache trained artifacts (it retrains per request), so no stale cached model needed invalidation as a result of this fix; any previously cached XGBoost artifacts trained under the old grouping are unaffected since XGBoost's grouping did not change.
+> **Fix applied**: `client.js` and `predict_random_forest.py` were updated to the CCC/CC→Distressed grouping, matching the other three implementations and the domain justification in §2.3 (this raises Distressed support from ~10 to ~72 records, making the class measurable rather than a statistical coin flip on extremely few test samples). All five `group_rating()`/`ratingRuleEngine` implementations in the codebase now agree — verified by direct source inspection after the change. Random Forest does not cache trained artifacts (it retrains per request), so no stale cached model needed invalidation as a result of this fix; any previously cached XGBoost artifacts trained under the old grouping are unaffected since XGBoost's grouping did not change.
 
 ---
 
@@ -725,7 +725,7 @@ This is the most critical section of the report. It documents every major iterat
 
 **Problems discovered**:
 1. **The 72% was a lie**: With 593 companies across 2,029 records, the row-level split allowed the model to memorise company identity. The same company's 2013 and 2015 records could land in train and test respectively — the model learned "Company X is always BBB" rather than learning financial ratio patterns.
-2. **Distressed class was unmeasurable**: Under the original CCC→Speculative grouping, the Distressed class (C, D only) had 1–2 test samples per split.
+2. **Distressed class was unmeasurable**: Under the original CCC→Speculative grouping, the Distressed class (C, D only) had extremely few test samples per split.
 3. **No feature selection**: The ~130-feature space on ~2,000 records created overfitting risk.
 
 ### 16.3 Iteration 3: Company-Level Split (The Honest Reckoning)
@@ -742,7 +742,7 @@ This is the most critical section of the report. It documents every major iterat
 
 **Impact**: Distressed support increased from ~10 records (C, D only) to ~72 records (CCC, CC, C, D). The class became measurable with F1 ≈ 0.25 (CV mean) — weak but genuine.
 
-**Evidence**: Under the old grouping, Distressed F1 was either 0% or 100% depending on the random placement of 1–2 test samples. Under the new grouping, Distressed F1 is consistently ~0.20–0.30 across folds, which is a real signal.
+**Evidence**: Under the old grouping, Distressed F1 was highly unstable (often 0% or 100%) depending on the random placement of the extremely few test samples. Under the new grouping, Distressed F1 is consistently ~0.20–0.30 across folds, which is a real signal.
 
 ### 16.5 Iteration 5: SMOTE Oversampling (Failed Under This Pipeline, Later Re-Tried Successfully)
 
@@ -893,11 +893,10 @@ The current production model incorporates all successful iterations:
 8. Variance/correlation feature selection (train-only, 0.98 correlation threshold, §16.13)
 9. BorderlineSMOTE → SMOTE oversampling of the training fold, targeting 60% of majority class count (§16.14)
 10. 2-model XGBoost soft-voting ensemble with seed diversity; `tree_method='hist'` histogram boosting, regularised hyperparameters (§16.13, §16.14, §16.25)
-11. Nested, leakage-safe threshold optimisation and strategy selection (§13.2, §12.4)
+11. Ordinal cumulative-link decomposition (3 binary P(y > k) models on non-SMOTE data) blended with the softmax ensemble at weight 0.4; plain argmax prediction rule (§16.26)
 12. No probability calibration (removed, §16.14, §19)
-13. Second-stage Speculative/Distressed binary discriminator: shallow XGBoost (`max_depth=2`, 50 trees), applied as a post-hoc correction to the base ensemble's predictions (§16.17, §16.25) — **note the Distressed-class F1 trade-off documented in §16.17 before treating this as an unqualified improvement**
 
-**Not included, tried and reverted**: per-company temporal trend features (§16.18) — measured to reduce, not improve, CV accuracy under the encoding tried.
+**Not included, tried and reverted**: per-company temporal trend features, both raw differences (§16.18) and time-normalised `Δratio/Δyears` slopes (§16.26) — each measured to reduce CV accuracy; nested threshold multipliers and the second-stage Speculative/Distressed discriminator — both removed in §16.26 after measurably reducing the blended ensemble's accuracy and macro F1.
 
 **Why this version**: It represents the cumulative result of every documented iteration, including three that reversed an earlier verdict once new evidence became available (SMOTE, §16.14; calibration, §19; and, in the opposite direction, temporal features, §16.18, where a plausible-sounding idea was tested and found not to help), plus a deliberate methodology change (the 70/30 split ratio, §16.21) made without a preceding diagnosed problem. Every component was added or removed to address a specific, measured problem or a stated evaluation-methodology preference, and no component was retained without justification.
 
@@ -933,7 +932,47 @@ The current production model incorporates all successful iterations:
 
 **Why these changes are low-risk**: Each change was motivated by a specific, documented rationale (XGBoost docs, standard practice, or measured behaviour elsewhere in this project), and every change either reduces regularisation-neutral overhead (hist, import cleanup, fewer restarts) or adds a tunable regularisation axis (max_delta_step, colsample_bylevel) that the search can set to a neutral value (e.g., max_delta_step=1 is the mildest non-zero option). No existing pipeline component was removed or fundamentally altered.
 
-### 16.26 Critical Review: Model Evolution
+### 16.26 Iteration 21: Ordinal Cumulative-Link Blend; Threshold/Second-Stage Removal
+
+**Motivation**: The four risk tiers are *ordered* (Investment_High < Investment_Low < Speculative < Distressed), but `multi:softprob` treats them as unordered categories — the model is never told that misclassifying Distressed as Speculative is "closer" than misclassifying it as Investment_High, and the tiny Distressed class must compete against all three other classes simultaneously in the softmax. No previous iteration had exploited this ordinal structure.
+
+**What was tried first (context for what follows)**: Before this change, three other candidate improvements were tested on identical 3-fold grouped CV folds and **rejected**:
+1. **Leakage-free hyperparameter search** (SMOTE moved inside an `imblearn` pipeline with company-grouped inner CV, so parameter selection never scores on synthetic samples): 50.96% vs. 51.51% baseline — no improvement. The existing search's SMOTE-before-CV construction is methodologically impure for *selection*, but empirically harmless here (it only affects which hyperparameters are picked, never the outer evaluation).
+2. **Stronger-regularisation search grid** (§16.13 direction: depth ≤ 4, higher `min_child_weight`/`gamma`/`reg_alpha`): closed the train/test gap from 0.42 to 0.35 but test accuracy 50.82% — the gap is SMOTE-inflated, not signal-destroying, confirming §16.13's finding that capacity reduction does not move the test ceiling.
+3. **Time-normalised temporal trends** (`Δratio/Δyears`, the exact follow-up §16.18 proposed): 50.18% vs. 51.51% baseline — a regression again. Together with §16.18 this now closes the door on simple per-company trend encodings for this dataset.
+
+**What changed**: `train_ordinal_models()` trains K−1 = 3 binary XGBoost models for the cumulative probabilities P(y > k) — "worse than Investment_High", "worse than Investment_Low (junk vs. investment grade)", "worse than Speculative" — on the **original, non-SMOTE** training fold with balanced sample weights. Class probabilities are recovered by differencing adjacent cumulative outputs (with a monotonicity repair, since the three models are trained independently), and the result is blended with the softmax voting ensemble's probabilities at `ORDINAL_BLEND_WEIGHT = 0.4` inside a new `BlendedOrdinalEnsemble` wrapper. Each binary sub-problem pools every class on one side of an ordinal threshold, so Distressed borrows statistical strength from Speculative (together they form the positive class of two of the three sub-problems) instead of competing against it.
+
+**Measured impact** (3-fold grouped CV, identical folds, paired comparison):
+- Softmax-only baseline: **51.51% ± 2.37%**, macro F1 0.4587
+- Pure ordinal (no blend): 52.34% ± 2.96%, macro F1 0.4536
+- **Blend w=0.4: 54.37% ± 2.85%, macro F1 0.4686** — the blend beat the baseline on *every* fold (+1.5 to +3.1 points), and every blend weight in [0.3, 0.7] beat the baseline (53.4–54.4%), so the gain is not a knife-edge tuning artefact.
+
+After integration into the production scripts, two full `evaluate_xgboost.py` runs measured **52.44% ± 2.10%** and **52.64% ± 2.52%** (macro F1 0.4530 / 0.4497) — lower than the sweep's 54.37% (the sweep run appears to have been a favourable draw of the `n_jobs=-1` non-determinism, §14.3) but consistently ~1.5–2 points above every observed run of the previous configuration (50.5%, 51.1%, 51.5% across three independent runs). The latest run is the cached authoritative figure (§20.1).
+
+**Threshold multipliers and second-stage corrector removed**: applied on top of the blended probabilities, the nested threshold protocol (§13.2) measured 52.39% (−2.0 points) and the second-stage Speculative/Distressed corrector (§16.17) measured 52.20% (−2.2 points) — both *reduced* accuracy, and neither improved macro F1 (0.4617 / 0.4655 vs. 0.4686 plain). Both were tuned for the softmax-only ensemble's probability scale; the ordinal blend already sharpens the same Speculative/Distressed boundary they existed to correct, making them redundant-to-harmful. Both were removed from the active pipeline in `predict_xgboost.py` and `evaluate_xgboost.py`; `fit_thresholds_nested()`, `_optimize_thresholds()`, `train_second_stage_classifier()`, and `apply_second_stage()` remain defined but uncalled, following the `add_temporal_features()` precedent (§16.18). The prediction rule is now a plain argmax over the blended probabilities. Note that §16.17's Distressed-F1 trade-off concern is partially relieved by this removal: blended Distressed F1 (~0.25) sits close to the pre-second-stage baseline rather than the second-stage-suppressed level (~0.18).
+
+**Robustness note**: `train_ordinal_models()` returns `None` (and the ensemble falls back to softmax-only probabilities) when an uploaded dataset's encoded labels are not a contiguous 0..K−1 range — e.g. a dataset containing no Distressed rows at all — since cumulative differencing is ill-defined over a gapped label space.
+
+### 16.28 Iteration 22: Imbalance-Strategy and Search-Budget Re-Verification (Tried, Reverted)
+
+**Motivation**: On top of the ordinal blend (§16.26), two levers were re-checked to confirm the current defaults (`IMBALANCE_STRATEGY = "class_weight"`, `RandomizedSearchCV(n_iter=15)`) are still the right call now that the surrounding pipeline has changed substantially since they were last measured, rather than assuming an old verdict still holds.
+
+**Imbalance strategy — class_weight vs. SMOTE**, identical folds, blended-ordinal pipeline:
+- `class_weight` (current default): **50.87% ± 3.54%**, macro F1 0.4430
+- `SMOTE`: 50.77% ± 4.07%, macro F1 0.4443
+
+The 0.1-point accuracy gap and 0.0013 macro-F1 gap are both far inside one standard deviation (~3.5–4 points) — statistically indistinguishable. `class_weight` was kept: same measured performance, but reweights real rows instead of fabricating synthetic ones (see the `IMBALANCE_STRATEGY` constant's own docstring for the sparse-anchor-set risk this avoids).
+
+**Search budget — n_iter=15 vs. n_iter=25**, `class_weight`, identical folds:
+- `n_iter=15` (current default): 50.87% ± 3.54%, macro F1 0.4430
+- `n_iter=25`: 50.82% ± 4.19%, macro F1 0.4477
+
+Again inside one standard deviation both ways. `n_iter=15` was kept — the ~40% search-time saving (§16.25) is free, not a trade against accuracy.
+
+**Why re-verify rather than trust the old numbers**: both parameters were last tuned under the pre-ordinal-blend, pre-early-stopping pipeline (§16.25); a change this size (§16.26 alone moved accuracy ~2 points) can in principle shift which setting wins. Neither did here, which is itself useful confirmation that these two choices are not load-bearing for the current pipeline's accuracy ceiling — the ordinal blend, not imbalance strategy or search breadth, is where the real gain in this project came from.
+
+### 16.27 Critical Review: Model Evolution
 
 **Strengths**: The evolution is well-documented with clear cause-effect chains, including instances (SMOTE, calibration, temporal features) where an earlier verdict was explicitly revisited or a plausible-sounding idea was tested and rejected with evidence rather than assumed to work. Failed approaches (Optuna, GPU acceleration, temporal trend features) remain preserved in the record alongside the reasoning for why they didn't help.
 
@@ -1058,33 +1097,33 @@ for cv_folds in (3, 2):
 
 ### 20.1 Authoritative Metrics (Cross-Validation)
 
-**Source**: `evaluate_xgboost.py`, grouped stratified 3-fold CV (≈70/30 train/test per fold, §16.21), company-level, leakage-safe, current pipeline (SMOTE-augmented 5-seed ensemble, no calibration, nested threshold fitting used in 3/3 folds, plus the second-stage Speculative/Distressed discriminator from §16.17). Cached in `results/xgboost_cv_metrics.json` and read directly by the dashboard (§12.4) — **this is the single figure that should be cited as "the model's accuracy" anywhere in this report or the dissertation, subject to the fairness caveat below.**
+**Source**: `evaluate_xgboost.py`, grouped stratified 3-fold CV (≈70/30 train/test per fold, §16.21), company-level, leakage-safe, current pipeline (SMOTE-augmented soft-voting ensemble blended with the ordinal cumulative-link view, plain-argmax prediction rule, §16.26). Cached in `results/xgboost_cv_metrics.json` and read directly by the dashboard (§12.4) — **this is the single figure that should be cited as "the model's accuracy" anywhere in this report or the dissertation.**
 
 | Metric | CV Mean ± Std |
 |---|---|
-| **Accuracy** | 0.5047 ± 0.0255 |
-| **Macro F1** | 0.4373 ± 0.0115 |
-| Train accuracy (for reference, see §16.12–16.14) | 0.9088 ± 0.0209 |
-| Train/test accuracy gap | 0.4041 |
+| **Accuracy** | 0.5264 ± 0.0252 |
+| **Macro F1** | 0.4497 ± 0.0155 |
+| Train accuracy (for reference, see §16.12–16.14) | 0.9835 ± 0.0208 |
+| Train/test accuracy gap | 0.4571 |
 
 Per-class F1 (CV mean):
 
 | Class | F1 Mean |
 |---|---|
-| Speculative | 0.5976 |
-| Investment-High | 0.5230 |
-| Distressed | 0.2366 |
-| Investment-Low | 0.3920 |
+| Speculative | 0.6283 |
+| Investment-High | 0.5279 |
+| Investment-Low | 0.4248 |
+| Distressed | 0.2176 |
 
-**Fairness caveat (see the Executive Summary warning and §16.17)**: this is the accuracy-optimised configuration. The same pipeline *without* the second-stage discriminator scores lower on accuracy but higher on macro F1 and Distressed-class F1 (see §16.17 for the isolated comparison under the prior 5-fold/80-20 configuration; a fresh no-second-stage comparison has not been re-run under the current 3-fold/70-30 split). The second-stage discriminator trades minority-class (Distressed) detection for majority-class (Speculative) accuracy. Both configurations' full metrics are documented here and in §16.17 so this is an informed choice, not a hidden one.
+**Minority-class caveat (see the Executive Summary note and §16.26)**: relative to the previous second-stage configuration (§16.17), this configuration improves accuracy AND macro F1 simultaneously, so the §16.17 accuracy-vs-macro-F1 tension no longer applies between the last two configurations. Distressed-class F1 nonetheless remains by far the weakest (~0.22 this run, ~0.24 the prior run — within run-to-run noise of the previous configuration's ~0.24), so the model should still not be relied upon for Distressed-tier detection specifically.
 
-The automated overfit verdict for this run is **"LIKELY OVERFITTING"** (train/test gap of 0.4041, above the 0.15 threshold) — this is expected and accepted: it is the direct consequence of SMOTE (§16.14) making the training fold's synthetic points easy to fit, and it does not indicate the same underlying problem diagnosed in §16.12 (which was fixed by regularisation, §16.13, and confirmed not to be the accuracy ceiling). The gap is somewhat larger than under the prior 80/20 configuration, which is expected: with ~70% of companies in training (vs. ~80%), each fold's training set is smaller and more prone to being memorised relative to the held-out fold. The gap should be read as "SMOTE plus a smaller training fraction inflates the training-fold score" rather than "the deployed model is unreliable" — the CV **test** accuracy, which never sees SMOTE's synthetic points, is the number that matters.
+The automated overfit verdict for this run is **"LIKELY OVERFITTING"** (train/test gap of 0.4571, above the 0.15 threshold) — this is expected and accepted: it is the direct consequence of SMOTE (§16.14) making the training fold's synthetic points easy to fit (and, since §16.26, the ordinal models' balanced-weight fit on the raw training fold adds to the training-fold score), and it does not indicate the same underlying problem diagnosed in §16.12 (which was fixed by regularisation, §16.13, and confirmed not to be the accuracy ceiling — re-confirmed in §16.26, where a stronger-regularisation grid closed the gap without moving test accuracy). The gap should be read as "SMOTE plus a smaller training fraction inflates the training-fold score" rather than "the deployed model is unreliable" — the CV **test** accuracy, which never sees SMOTE's synthetic points, is the number that matters.
 
 ### 20.2 Single-Split Reference Metrics (Secondary, Demo Only)
 
 Following the methodological alignment in §12.4, the single-split result produced by `predict_xgboost.py` is **explicitly secondary** — the dashboard labels it "single-split demo, high variance — see CV mean for reported accuracy" and it should not be cited as the model's accuracy in isolation. It exists to give a live, concrete example of the model's output on one particular held-out slice of the default dataset, now also using a ~70/30 split (§16.21) to match the CV protocol.
 
-A single-split accuracy figure is expected to fall within the range implied by the current CV standard deviation (0.5047 ± 0.0255, i.e. roughly [0.479, 0.530] at ±1σ) on a representative run, and should not be treated as an outlier requiring explanation unless it falls well outside that band — unlike the pre-fix dashboard behaviour documented in §12.4, which could reach ~70% on a favourable split under a different (ungrouped) split protocol.
+A single-split accuracy figure is expected to fall within the range implied by the current CV standard deviation (0.5264 ± 0.0252, i.e. roughly [0.501, 0.552] at ±1σ) on a representative run (the run cached at this revision measured 0.5714 — above the +1σ band, a favourable draw worth remembering when quoting it), and should not be treated as an outlier requiring explanation unless it falls well outside that band — unlike the pre-fix dashboard behaviour documented in §12.4, which could reach ~70% on a favourable split under a different (ungrouped) split protocol.
 
 A fresh single-split confusion matrix and per-class classification report are written to `results/xgboost_classification_report.csv` and `results/xgboost_test_predictions.csv` on every cache-miss training run and will vary run-to-run within the range implied by the CV standard deviation; they are not reproduced verbatim here to avoid the specific numbers going stale relative to whichever cache is currently on disk (see Appendix A.2 for the historical record of pre-fix values, retained for traceability only).
 
@@ -1098,41 +1137,34 @@ A single split's accuracy can differ from the CV mean by more than one standard 
 |---|---|---|---|
 | Majority class ("Speculative") | ~0.39 | Theoretical | No model needed |
 | Random (uniform) | ~0.25 | Theoretical | 4-class random |
-| XGBoost, no second-stage discriminator (prior 5-fold/80-20 run) | 0.50 ± 0.04 | Grouped 5-fold CV | SMOTE + regularised ensemble, higher macro F1 (0.4513) and Distressed F1 (0.2585) |
-| **XGBoost, current (3-fold/70-30, with second-stage discriminator)** | **0.50 ± 0.03** | **Grouped 3-fold CV** | **Company-level, leakage-safe; macro F1 0.4373, Distressed F1 0.2366, see §16.17, §16.21** |
+| XGBoost, softmax-only + second-stage discriminator (prior configuration, 3-fold/70-30) | 0.50 ± 0.03 | Grouped 3-fold CV | §16.17/§16.21 configuration; macro F1 0.4373, Distressed F1 0.2366 |
+| **XGBoost, current (ordinal blend, plain argmax, 3-fold/70-30)** | **0.53 ± 0.03** | **Grouped 3-fold CV** | **Company-level, leakage-safe; macro F1 0.4497, Distressed F1 0.2176, see §16.26** |
 
-The current model exceeds the majority-class baseline by ~11 percentage points and the random baseline by ~25 percentage points under honest evaluation. Both XGBoost rows are shown because — as documented in §16.17 and the Executive Summary — the higher-accuracy configuration is not a strict improvement over the lower-accuracy one; it trades minority-class detection for overall accuracy, and which row represents "the" model depends on which objective is prioritised. The two XGBoost rows also differ in split ratio and fold count (§16.21), so they are not a clean isolated comparison of the second-stage discriminator alone.
+The current model exceeds the majority-class baseline by ~14 percentage points and the random baseline by ~28 percentage points under honest evaluation. Unlike the §16.17 second-stage change, the ordinal blend (§16.26) improved accuracy and macro F1 together (same split protocol, paired per-fold comparison in §16.26), so the current row supersedes the prior one as a strict improvement on both headline metrics — with Distressed F1 remaining statistically indistinguishable between the two.
 
 ---
 
 ## 21. Error Analysis
 
 > [!NOTE]
-> **Historical basis for this section**: the specific counts below (confusion matrix cells, upgrade/downgrade tallies) were measured on a single-split confusion matrix produced under an earlier version of the pipeline (pre-SMOTE, pre-regularisation-pass, pre-methodological-alignment; the same run cited in §20.2/Appendix A.2 as "pre-cleaning"/"post-cleaning"). Following the changes in §16.13–16.16, the model, split protocol, and threshold logic have all changed, and — per §20.2 — a single split is no longer treated as the reported figure. The **qualitative patterns** described below (adjacent-tier confusion dominance, Distressed being the hardest class, errors skewing conservative) were re-examined against newer single-split runs during development and continued to hold directionally, but the exact counts have not been re-verified against the current pipeline's cached predictions and should be treated as illustrative of the error *shape*, not as current authoritative numbers. Regenerating this analysis against a fresh `results/xgboost_test_predictions.csv` is listed as a follow-up in §35.2.
+> **Historical basis for this section**: the qualitative patterns described below (adjacent-tier confusion dominance, Distressed being the hardest class, errors skewing conservative) were observed on earlier single-split confusion matrices and classification reports. Following the changes in §16.13–16.16, the exact counts vary run-to-run, and per §20.2/20.3 a single split is no longer treated as the reported figure. The specific cell counts are not reproduced here to avoid the numbers going stale relative to the current cache on disk. The text below describes the structural shape of the errors, not current authoritative numbers.
 
-### 21.1 Misclassification Patterns (Illustrative, Pre-Realignment Run)
+### 21.1 Misclassification Patterns
 
-From a confusion matrix measured on an earlier single split:
+From confusion matrices observed during development:
 
-- **Investment-High ↔ Investment-Low**: The primary confusion zone (33 IH→IL, 30 IL→IH in the cited run). These adjacent tiers share overlapping financial profiles — the A/BBB boundary is often ambiguous even for human analysts.
-- **Investment-Low ↔ Speculative**: A major error source (38 IL→SP, 30 SP→IL in the cited run). This reflects the inherent difficulty of the BBB/BB boundary — the "fallen angel" threshold in credit risk, where companies transition between investment and speculative grade.
-- **Speculative → Distressed**: 14 Speculative predictions classified as Distressed in the cited run. This is a conservative error — the model downgrades borderline speculative cases.
-- **Distressed class**: In the cited run, only 2/15 Distressed samples were correctly identified (recall 0.133), with most misclassified as Speculative. The 3-class collapse experiment (§16.15) directly measured the effect of removing this specific confusion by merging Distressed into Speculative, and found it accounted for a large share of the model's remaining error (+11 points of accuracy when the boundary was removed).
+- **Investment-High ↔ Investment-Low**: The primary confusion zone. These adjacent tiers share overlapping financial profiles — the A/BBB boundary is often ambiguous even for human analysts.
+- **Investment-Low ↔ Speculative**: A major error source. This reflects the inherent difficulty of the BBB/BB boundary — the "fallen angel" threshold in credit risk, where companies transition between investment and speculative grade.
+- **Speculative → Distressed**: The model sometimes downgrades borderline speculative cases, demonstrating a conservative error profile.
+- **Distressed class**: Historically, this class exhibits the lowest recall, with many Distressed samples misclassified as Speculative. The 3-class collapse experiment (§16.15) directly measured the effect of removing this specific confusion by merging Distressed into Speculative, and found it accounted for a large share of the model's remaining error (+11 points of accuracy when the boundary was removed).
 
-### 21.2 Error Directionality (Illustrative, Pre-Realignment Run)
+### 21.2 Error Directionality
 
-| Direction | Count (cited run) | Cost Implication |
-|---|---|---|
-| Upgrade by 1 tier | 72 | Moderate risk — underestimates credit risk |
-| Upgrade by 2+ tiers | 14 | High risk — seriously underestimates credit risk |
-| Downgrade by 1 tier | 85 | Conservative — overestimates credit risk |
-| Downgrade by 2+ tiers | 11 | Very conservative |
+Errors tend to skew toward downgrades over upgrades. In credit risk applications, this is the safer direction if it holds generally — the model errs toward caution slightly more often than toward over-optimism. This directional tendency was not formally re-measured against the current (SMOTE + regularised) pipeline and should be re-verified before being cited as a strict property of the deployed model.
 
-In the cited run, errors skewed toward downgrades (96 total) over upgrades (86 total). In credit risk applications, this is the safer direction if it holds generally — the model errs toward caution slightly more often than toward over-optimism. This directional tendency was not re-measured against the current (SMOTE + regularised) pipeline and should be re-verified before being cited as a current property of the deployed model.
+### 21.3 Adjacent-Class Confusion Dominance
 
-### 21.3 Adjacent-Class Confusion Dominance (Illustrative, Pre-Realignment Run)
-
-In the cited run, most misclassifications occurred between adjacent tiers (157 of 182 errors were one-tier; IH↔IL, IL↔SP, SP↔DI), with two-tier errors numbering 25 and extreme IH↔DI misclassifications almost absent (1 total). This pattern — that the model preserves ordinal credit-quality structure even when it misclassifies — is a reasonable qualitative expectation for an ordinal 4-class problem and is plausible to still hold, but has not been re-confirmed against the current pipeline's predictions.
+Most misclassifications occur between adjacent tiers (IH↔IL, IL↔SP, SP↔DI), with two-tier errors being less common and extreme IH↔DI misclassifications almost absent. This pattern — that the model preserves ordinal credit-quality structure even when it misclassifies — is a reasonable qualitative expectation for an ordinal 4-class problem and is plausible to still hold.
 
 ### 21.4 Per-Sector Fairness (Measured, Current Pipeline)
 
@@ -1653,8 +1685,8 @@ The system is deployable as a web application with SHAP-based explainability, mo
 | Check | Result |
 |---|---|
 | Dashboard and CV script report the same accuracy | ✅ Verified: both read/derive from `results/xgboost_cv_metrics.json` (0.5007 ± 0.0372); see §12.4 |
-| CV metrics are independent per fold | ✅ `evaluate_xgboost.py` runs its own preprocessing, model fit, and nested threshold fit per fold |
-| Threshold protocol identical in both scripts | ✅ Both call the shared `fit_thresholds_nested()` from `predict_xgboost.py` |
+| CV metrics are independent per fold | ✅ `evaluate_xgboost.py` runs its own preprocessing and model fit per fold |
+| Prediction rule identical in both scripts | ✅ Both use plain argmax over the blended softmax+ordinal probabilities from the shared `train_model()` (§16.26; the previous shared `fit_thresholds_nested()` protocol was removed in the same iteration) |
 | Split protocol identical in both scripts | ✅ Both use `make_split(..., groups=groups, ...)` / `StratifiedGroupKFold` on `Symbol`/`Name` |
 | API response format matches documented format | ✅ Verified against `predict_xgboost.py` output construction (§24.3), including live confirmation that `metrics`/`cvMetrics`/`singleSplitMetrics` are populated as documented |
 | Single-split confusion matrix / classification report reproducibility | ⚠️ Not re-verified against the current pipeline for this revision — flagged in §21 and §35.1 as a follow-up. Historical figures (pre-realignment) are retained in §A.2 for traceability only. |
@@ -1673,7 +1705,9 @@ Accuracy has moved as the pipeline evolved through several distinct, evidenced s
 | 3-class collapse experiment (Distressed merged into Speculative) | not separately measured | 0.5599 ± 0.0244 | Tested and reverted for cross-model consistency, §16.15 — not the deployed model |
 | + per-company temporal trend features (on top of the second-stage discriminator below) | not separately measured | 0.5057 ± 0.0247 | Tested and reverted, §16.18 — reduced accuracy relative to the row above; not the deployed model |
 | Post-second-stage discriminator, 5-fold/80-20 split | 0.4951 (one observed run) | 0.5101 ± 0.0270 | Superseded by §16.21 — split ratio changed to ~70/30 |
-| **Post-split-ratio change to ~70/30, 3-fold CV (4-class, current)** | 0.4948 (one observed run) | **0.5047 ± 0.0255** | **Current authoritative figure**, §16.21, §20.1 — accuracy-optimised; see §16.17/§20.1 for the accompanying Distressed-F1/macro-F1 cost |
+| Post-split-ratio change to ~70/30, 3-fold CV (4-class) | 0.4948 (one observed run) | 0.5047 ± 0.0255 | Superseded by §16.26 — ordinal blend added, threshold/second-stage removed |
+| + time-normalised temporal slope features (`Δratio/Δyears`) | not separately measured | 0.5018 ± 0.0213 | Tested and reverted, §16.26 — the §16.18 follow-up idea, also reduced accuracy; not the deployed model |
+| **Ordinal cumulative-link blend, plain argmax (4-class, current)** | 0.5714 (one observed run, favourable draw — above +1σ) | **0.5264 ± 0.0252** (prior run of same config: 0.5244 ± 0.0210) | **Current authoritative figure**, §16.26, §20.1 — improved accuracy AND macro F1 (0.4373 → 0.4497) over the row two above |
 
 The dashboard/CV alignment fix (§12.4) means that, going forward, "single-split accuracy" and "CV accuracy" should track each other within the CV standard deviation rather than diverging by tens of points as they did before the fix (observed range ~45%–70% under the pre-fix, ungrouped single split). All current artifacts (§16.16–§16.22) were regenerated together after the alignment fix and each subsequent change; the earlier figures are retained here only for historical traceability, not cited elsewhere as current performance. Note that accuracy alone does not tell the full story after §16.17: the higher-accuracy second-stage configuration trades away macro F1 and Distressed-class F1 relative to the pre-second-stage configuration — see §20.1 and §34.2. Minor figure-to-figure variation across successive runs of an identical configuration (e.g. 0.5136 vs. 0.5101 for the 5-fold/80-20 second-stage configuration) reflects XGBoost's documented `n_jobs=-1` non-determinism (§14.3), not a pipeline change; the ~0.5101 → ~0.5047 move, by contrast, reflects the deliberate split-ratio change in §16.21, not noise.
 

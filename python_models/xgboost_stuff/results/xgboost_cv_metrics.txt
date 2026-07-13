@@ -1,36 +1,36 @@
 cv_folds: 3
 split: grouped_stratified (company-level, leakage-safe)
-threshold_protocol: nested company-level inner split per fold (used in 3/3 folds)
-train_accuracy_mean: 0.9088
-train_accuracy_std: 0.0209
-test_accuracy_mean: 0.5047
-test_accuracy_std: 0.0255
-train_test_accuracy_gap: 0.4041
-train_macro_f1_mean: 0.8743
-test_macro_f1_mean: 0.4373
-train_test_macro_f1_gap: 0.4370
-accuracy_mean: 0.5047
-accuracy_std: 0.0255
-macro_f1_mean: 0.4373
-macro_f1_std: 0.0115
+prediction_rule: plain argmax over blended softmax+ordinal probabilities (threshold multipliers and second-stage corrector removed, see report §16.26)
+train_accuracy_mean: 0.7846
+train_accuracy_std: 0.0190
+test_accuracy_mean: 0.5131
+test_accuracy_std: 0.0364
+train_test_accuracy_gap: 0.2715
+train_macro_f1_mean: 0.7747
+test_macro_f1_mean: 0.4522
+train_test_macro_f1_gap: 0.3225
+accuracy_mean: 0.5131
+accuracy_std: 0.0364
+macro_f1_mean: 0.4522
+macro_f1_std: 0.0279
 
-LIKELY OVERFITTING: train accuracy exceeds test accuracy by 0.4041 (>0.15 threshold). Feature-space reduction, stronger regularization, or fewer boosting rounds are worth trying.
-f1_Investment_High_mean: 0.5230
-f1_Investment_Low_mean: 0.3920
-f1_Speculative_mean: 0.5976
-f1_Distressed_mean: 0.2366
+LIKELY OVERFITTING: train accuracy exceeds test accuracy by 0.2715 (>0.15 threshold). Feature-space reduction, stronger regularization, or fewer boosting rounds are worth trying.
+f1_Investment_High_mean: 0.5501
+f1_Investment_Low_mean: 0.3419
+f1_Speculative_mean: 0.6177
+f1_Distressed_mean: 0.2989
 
 === Per-sector breakdown (pooled test predictions across all folds) ===
-LARGE SECTOR DISPARITY: accuracy spread across sectors with >= 20 test rows is 0.3442 (worst: Miscellaneous at 0.3158, best: Finance at 0.6600). Sector-conditional thresholds or a sector-interaction feature may be worth investigating for the weaker sector(s).
-  Miscellaneous                  n=  57  accuracy=0.3158  macro_f1=0.2804
-  Health Care                    n= 171  accuracy=0.4152  macro_f1=0.3880
-  Energy                         n= 294  accuracy=0.4422  macro_f1=0.3905
-  Public Utilities               n= 211  accuracy=0.4550  macro_f1=0.3507
-  Transportation                 n=  63  accuracy=0.4921  macro_f1=0.4027
-  Capital Goods                  n= 233  accuracy=0.5236  macro_f1=0.4704
-  Consumer Services              n= 250  accuracy=0.5240  macro_f1=0.3998
-  Consumer Non-Durables          n= 132  accuracy=0.5455  macro_f1=0.3753
-  Basic Industries               n= 260  accuracy=0.5577  macro_f1=0.3763
-  Technology                     n= 234  accuracy=0.5598  macro_f1=0.4561
-  Consumer Durables              n=  74  accuracy=0.5946  macro_f1=0.3912
-  Finance                        n=  50  accuracy=0.6600  macro_f1=0.6506
+MODERATE SECTOR DISPARITY: accuracy spread across sectors with >= 20 test rows is 0.2287 (worst: Public Utilities at 0.4313, best: Finance at 0.6600). Present but not dominant; likely within normal sampling variation given ~593 companies split across ~12 sectors.
+  Public Utilities               n= 211  accuracy=0.4313  macro_f1=0.4328
+  Health Care                    n= 171  accuracy=0.4503  macro_f1=0.3968
+  Energy                         n= 294  accuracy=0.4558  macro_f1=0.4045
+  Miscellaneous                  n=  57  accuracy=0.4737  macro_f1=0.3637
+  Transportation                 n=  63  accuracy=0.4762  macro_f1=0.3749
+  Capital Goods                  n= 233  accuracy=0.5107  macro_f1=0.5064
+  Consumer Services              n= 250  accuracy=0.5520  macro_f1=0.4479
+  Consumer Non-Durables          n= 132  accuracy=0.5530  macro_f1=0.3635
+  Technology                     n= 234  accuracy=0.5556  macro_f1=0.3815
+  Basic Industries               n= 260  accuracy=0.5615  macro_f1=0.3204
+  Consumer Durables              n=  74  accuracy=0.5811  macro_f1=0.5065
+  Finance                        n=  50  accuracy=0.6600  macro_f1=0.6672

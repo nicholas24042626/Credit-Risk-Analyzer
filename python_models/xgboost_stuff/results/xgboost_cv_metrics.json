@@ -1,146 +1,142 @@
 {
-  "generated_at": "2026-07-07T14:09:02.983078+00:00",
+  "generated_at": "2026-07-13T05:29:28.627551+00:00",
   "cv_folds": 3,
   "split_strategy": "grouped_stratified",
-  "threshold_protocol": "nested_company_level_inner_split",
-  "thresholds_used_in_folds": 3,
-  "test_accuracy_mean": 0.5047,
-  "test_accuracy_std": 0.0255,
-  "train_accuracy_mean": 0.9088,
-  "train_accuracy_std": 0.0209,
-  "train_test_accuracy_gap": 0.4041,
-  "test_macro_f1_mean": 0.4373,
-  "test_macro_f1_std": 0.0115,
-  "train_macro_f1_mean": 0.8743,
-  "train_test_macro_f1_gap": 0.437,
+  "prediction_rule": "argmax_blended_softmax_ordinal",
+  "test_accuracy_mean": 0.5131,
+  "test_accuracy_std": 0.0364,
+  "train_accuracy_mean": 0.7846,
+  "train_accuracy_std": 0.019,
+  "train_test_accuracy_gap": 0.2715,
+  "test_macro_f1_mean": 0.4522,
+  "test_macro_f1_std": 0.0279,
+  "train_macro_f1_mean": 0.7747,
+  "train_test_macro_f1_gap": 0.3225,
   "per_class_f1_mean": {
-    "Investment_High": 0.523,
-    "Investment_Low": 0.392,
-    "Speculative": 0.5976,
-    "Distressed": 0.2366
+    "Investment_High": 0.5501,
+    "Investment_Low": 0.3419,
+    "Speculative": 0.6177,
+    "Distressed": 0.2989
   },
-  "overfit_verdict": "LIKELY OVERFITTING: train accuracy exceeds test accuracy by 0.4041 (>0.15 threshold). Feature-space reduction, stronger regularization, or fewer boosting rounds are worth trying.",
+  "overfit_verdict": "LIKELY OVERFITTING: train accuracy exceeds test accuracy by 0.2715 (>0.15 threshold). Feature-space reduction, stronger regularization, or fewer boosting rounds are worth trying.",
   "folds": [
     {
       "fold": 1,
       "n_train": 1352,
       "n_test": 677,
-      "train_accuracy": 0.8794,
-      "test_accuracy": 0.4786,
-      "train_test_gap": 0.4009,
-      "train_macro_f1": 0.8545,
-      "test_macro_f1": 0.4211,
-      "used_thresholds": true
+      "train_accuracy": 0.7589,
+      "test_accuracy": 0.4845,
+      "train_test_gap": 0.2744,
+      "train_macro_f1": 0.7438,
+      "test_macro_f1": 0.413
     },
     {
       "fold": 2,
       "n_train": 1352,
       "n_test": 677,
-      "train_accuracy": 0.9268,
-      "test_accuracy": 0.4963,
-      "train_test_gap": 0.4305,
-      "train_macro_f1": 0.878,
-      "test_macro_f1": 0.4464,
-      "used_thresholds": true
+      "train_accuracy": 0.7907,
+      "test_accuracy": 0.4904,
+      "train_test_gap": 0.3003,
+      "train_macro_f1": 0.7775,
+      "test_macro_f1": 0.467
     },
     {
       "fold": 3,
       "n_train": 1354,
       "n_test": 675,
-      "train_accuracy": 0.9202,
-      "test_accuracy": 0.5393,
-      "train_test_gap": 0.381,
-      "train_macro_f1": 0.8903,
-      "test_macro_f1": 0.4444,
-      "used_thresholds": true
+      "train_accuracy": 0.8043,
+      "test_accuracy": 0.5644,
+      "train_test_gap": 0.2398,
+      "train_macro_f1": 0.8027,
+      "test_macro_f1": 0.4764
     }
   ],
   "sector_breakdown": [
     {
       "sector": "Basic Industries",
       "n_test_rows": 260,
-      "accuracy": 0.5577,
-      "macro_f1": 0.3763,
+      "accuracy": 0.5615,
+      "macro_f1": 0.3204,
       "low_support": false
     },
     {
       "sector": "Capital Goods",
       "n_test_rows": 233,
-      "accuracy": 0.5236,
-      "macro_f1": 0.4704,
+      "accuracy": 0.5107,
+      "macro_f1": 0.5064,
       "low_support": false
     },
     {
       "sector": "Consumer Durables",
       "n_test_rows": 74,
-      "accuracy": 0.5946,
-      "macro_f1": 0.3912,
+      "accuracy": 0.5811,
+      "macro_f1": 0.5065,
       "low_support": false
     },
     {
       "sector": "Consumer Non-Durables",
       "n_test_rows": 132,
-      "accuracy": 0.5455,
-      "macro_f1": 0.3753,
+      "accuracy": 0.553,
+      "macro_f1": 0.3635,
       "low_support": false
     },
     {
       "sector": "Consumer Services",
       "n_test_rows": 250,
-      "accuracy": 0.524,
-      "macro_f1": 0.3998,
+      "accuracy": 0.552,
+      "macro_f1": 0.4479,
       "low_support": false
     },
     {
       "sector": "Energy",
       "n_test_rows": 294,
-      "accuracy": 0.4422,
-      "macro_f1": 0.3905,
+      "accuracy": 0.4558,
+      "macro_f1": 0.4045,
       "low_support": false
     },
     {
       "sector": "Finance",
       "n_test_rows": 50,
       "accuracy": 0.66,
-      "macro_f1": 0.6506,
+      "macro_f1": 0.6672,
       "low_support": false
     },
     {
       "sector": "Health Care",
       "n_test_rows": 171,
-      "accuracy": 0.4152,
-      "macro_f1": 0.388,
+      "accuracy": 0.4503,
+      "macro_f1": 0.3968,
       "low_support": false
     },
     {
       "sector": "Miscellaneous",
       "n_test_rows": 57,
-      "accuracy": 0.3158,
-      "macro_f1": 0.2804,
+      "accuracy": 0.4737,
+      "macro_f1": 0.3637,
       "low_support": false
     },
     {
       "sector": "Public Utilities",
       "n_test_rows": 211,
-      "accuracy": 0.455,
-      "macro_f1": 0.3507,
+      "accuracy": 0.4313,
+      "macro_f1": 0.4328,
       "low_support": false
     },
     {
       "sector": "Technology",
       "n_test_rows": 234,
-      "accuracy": 0.5598,
-      "macro_f1": 0.4561,
+      "accuracy": 0.5556,
+      "macro_f1": 0.3815,
       "low_support": false
     },
     {
       "sector": "Transportation",
       "n_test_rows": 63,
-      "accuracy": 0.4921,
-      "macro_f1": 0.4027,
+      "accuracy": 0.4762,
+      "macro_f1": 0.3749,
       "low_support": false
     }
   ],
-  "sector_accuracy_spread": 0.3442,
-  "sector_verdict": "LARGE SECTOR DISPARITY: accuracy spread across sectors with >= 20 test rows is 0.3442 (worst: Miscellaneous at 0.3158, best: Finance at 0.6600). Sector-conditional thresholds or a sector-interaction feature may be worth investigating for the weaker sector(s)."
+  "sector_accuracy_spread": 0.2287,
+  "sector_verdict": "MODERATE SECTOR DISPARITY: accuracy spread across sectors with >= 20 test rows is 0.2287 (worst: Public Utilities at 0.4313, best: Finance at 0.6600). Present but not dominant; likely within normal sampling variation given ~593 companies split across ~12 sectors."
 }

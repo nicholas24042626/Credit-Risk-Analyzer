@@ -8,15 +8,18 @@ import tempfile
 import warnings
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from shared_baseline import extract_groups, make_split, run_fair_baseline  # noqa: E402
+
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 warnings.filterwarnings("ignore")
 
@@ -99,8 +102,14 @@ def build_pipeline(X):
     numeric_features = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
     categorical_features = X.select_dtypes(include=["object"]).columns.tolist()
 
+    # StandardScaler matters here specifically (unlike the tree-based models
+    # in this project): unscaled financial ratios spanning wildly different
+    # magnitudes both slow lbfgs's convergence and distort the L1/L2 penalty,
+    # which penalizes large-magnitude coefficients more than the underlying
+    # feature actually warrants.
     numeric_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median"))
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
     ])
 
     categorical_transformer = Pipeline(steps=[
@@ -207,6 +216,17 @@ def main():
     if "Rating" not in df.columns:
         raise ValueError("The dataset must contain a Rating column.")
 
+    # Shared cross-model comparison tier: identical cleaning, split, features,
+    # and untuned-default estimator as the other three models' own
+    # fairBaseline (see shared_baseline.py) -- independent of, and computed
+    # before, this file's own GridSearchCV-tuned pipeline below. Note this
+    # intentionally does NOT scale features (StandardScaler), even though
+    # Logistic Regression benefits from it -- the point of this tier is what
+    # each algorithm does with no model-specific assistance at all.
+    fair_baseline = run_fair_baseline(
+        LogisticRegression(random_state=RANDOM_STATE), df
+    )
+
     df["RatingGroup"] = df["Rating"].apply(group_rating)
     df = df[df["RatingGroup"] != "Unknown"].copy()
 
@@ -224,12 +244,13 @@ def main():
     X = df.drop(columns=existing_drop_cols)
     y = df[target_col]
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.20,
-        random_state=RANDOM_STATE,
-        stratify=y
+    # Company-level grouped split (not plain stratify=y): a company's repeat
+    # year-rows must land entirely on one side of the split, or accuracy is
+    # inflated by the model training on near-duplicate rows of a company that
+    # also appears in the test set.
+    groups = extract_groups(df)
+    X_train, X_test, y_train, y_test, split_strategy = make_split(
+        X, y, groups=groups, test_size=0.20, random_state=RANDOM_STATE
     )
 
     baseline_model = build_pipeline(X)
@@ -441,7 +462,8 @@ def main():
                 [item["feature"], round(item["value"], 4)]
                 for item in shap_features
             ],
-            "shapStory": shap_story
+            "shapStory": shap_story,
+            "fairBaseline": fair_baseline["metrics"] if fair_baseline else None
         }
     }
 

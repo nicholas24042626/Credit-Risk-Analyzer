@@ -56,6 +56,8 @@ function initApp() {
   const secondaryMetricsSection = document.getElementById("secondaryMetricsSection");
   const secondaryMetricsNote = document.getElementById("secondaryMetricsNote");
   const secondaryStats = document.getElementById("secondaryStats");
+  const fairBaselineSection = document.getElementById("fairBaselineSection");
+  const fairBaselineStats = document.getElementById("fairBaselineStats");
   const predictionResult = document.getElementById("predictionResult");
 
   function formatPredictionLabel(label) {
@@ -257,6 +259,7 @@ function initApp() {
     const metrics = entry.metrics;
     const cvMetrics = entry.cvMetrics;
     const singleSplitMetrics = entry.singleSplitMetrics;
+    const fairBaseline = entry.fairBaseline;
 
     if (!metrics) {
       performanceLabel.textContent = "Key evaluation metrics for the selected model, plus a short read on the main strength and weakness.";
@@ -282,6 +285,7 @@ function initApp() {
       performanceWeakness.textContent = "No static Random Forest metrics are shown before training.";
       shapSummary.textContent = `Feature importance for ${model} appears after training.`;
       secondaryMetricsSection.style.display = "none";
+      fairBaselineSection.style.display = "none";
       return;
     }
 
@@ -364,6 +368,45 @@ function initApp() {
       `;
     } else {
       secondaryMetricsSection.style.display = "none";
+    }
+
+    // Fair cross-model baseline card: identical cleaning, split, features,
+    // and untuned-default estimator across all four models (see
+    // python_models/shared_baseline.py), so this is the one figure that's
+    // safe to directly compare between model tabs. Collapsed by default so
+    // it doesn't compete with each model's own headline metrics above.
+    if (fairBaseline) {
+      fairBaselineSection.style.display = "block";
+      const recallEntries = Object.entries(fairBaseline.recallPerClass || {});
+      fairBaselineStats.innerHTML = `
+        <div class="mini-card">
+          <h5>Accuracy</h5>
+          <p>${fairBaseline.accuracy}</p>
+        </div>
+        <div class="mini-card">
+          <h5>Weighted F1</h5>
+          <p>${fairBaseline.f1Weighted}</p>
+        </div>
+        <div class="mini-card">
+          <h5>Macro F1</h5>
+          <p>${fairBaseline.f1Macro}</p>
+        </div>
+        <div class="mini-card">
+          <h5>Split</h5>
+          <p>Grouped, company-level</p>
+        </div>
+        ${recallEntries
+          .map(
+            ([label, recall]) => `
+        <div class="mini-card">
+          <h5>${formatPredictionLabel(label)} recall</h5>
+          <p>${recall}</p>
+        </div>`
+          )
+          .join("")}
+      `;
+    } else {
+      fairBaselineSection.style.display = "none";
     }
   }
 

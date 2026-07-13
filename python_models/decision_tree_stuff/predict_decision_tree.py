@@ -1,5 +1,4 @@
 import base64
-import base64
 import io
 import json
 import os
@@ -9,13 +8,16 @@ import tempfile
 import warnings
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from shared_baseline import extract_groups, make_split, run_fair_baseline  # noqa: E402
+
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.tree import DecisionTreeClassifier
@@ -136,6 +138,14 @@ def main():
     if "Rating" not in df.columns:
         raise ValueError("The dataset must contain a Rating column.")
 
+    # Shared cross-model comparison tier: identical cleaning, split, features,
+    # and untuned-default estimator as the other three models' own
+    # fairBaseline (see shared_baseline.py) -- independent of, and computed
+    # before, this file's own SMOTE + tuned pipeline below.
+    fair_baseline = run_fair_baseline(
+        DecisionTreeClassifier(random_state=RANDOM_STATE), df
+    )
+
     df["RatingGroup"] = df["Rating"].apply(group_rating)
     df = df[df["RatingGroup"] != "Unknown"].copy()
 
@@ -153,13 +163,14 @@ def main():
     X = df.drop(columns=existing_drop_cols)
     y = df[target_col]
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.30,
-        random_state=RANDOM_STATE,
-        stratify=y
-    )
+    # Company-level grouped split (not plain stratify=y): a company's repeat
+    # year-rows must land entirely on one side of the split, or accuracy is
+    # inflated by the model training on near-duplicate rows of a company that
+    # also appears in the test set. Same fix already applied via
+    # shared_baseline's fairBaseline tier -- this brings this file's own
+    # PRIMARY reported number in line with it, not just the comparison tier.
+    groups = extract_groups(df)
+    X_train, X_test, y_train, y_test, split_strategy = make_split(X, y, groups=groups)
 
     preprocessor = build_pipeline(X)
     X_train_processed = preprocessor.fit_transform(X_train)
@@ -168,12 +179,35 @@ def main():
     smote = SMOTE(random_state=RANDOM_STATE, k_neighbors=5)
     X_train_balanced, y_train_balanced = smote.fit_resample(X_train_processed, y_train)
 
-    best_model = DecisionTreeClassifier(
-        criterion="gini",
-        min_samples_leaf=5,
-        random_state=RANDOM_STATE
+    # True baseline: untuned library defaults, same SMOTE-balanced data.
+    # Previously this "baseline" was just an alias for the tuned model's own
+    # predictions (dead code -- no separate fit ever happened), so the
+    # baseline/tuned comparison in the response was always 0.0000 apart.
+    baseline_model = DecisionTreeClassifier(random_state=RANDOM_STATE)
+    baseline_model.fit(X_train_balanced, y_train_balanced)
+    baseline_pred = baseline_model.predict(X_test_processed)
+    baseline_report = classification_report(y_test, baseline_pred, output_dict=True)
+    baseline_accuracy = float(accuracy_score(y_test, baseline_pred))
+    baseline_f1 = float(baseline_report["weighted avg"]["f1-score"])
+
+    # Tuned: small grid search over the tree's own highest-impact
+    # hyperparameters (previously a single hand-picked min_samples_leaf=5
+    # value with no search at all, despite being labelled "tuned").
+    param_grid = {
+        "criterion": ["gini", "entropy"],
+        "max_depth": [3, 5, 7, 10, None],
+        "min_samples_leaf": [1, 2, 5, 10],
+        "min_samples_split": [2, 5, 10],
+    }
+    grid_search = GridSearchCV(
+        estimator=DecisionTreeClassifier(random_state=RANDOM_STATE),
+        param_grid=param_grid,
+        cv=3,
+        scoring="f1_weighted",
+        n_jobs=1,
     )
-    best_model.fit(X_train_balanced, y_train_balanced)
+    grid_search.fit(X_train_balanced, y_train_balanced)
+    best_model = grid_search.best_estimator_
 
     tuned_pred = best_model.predict(X_test_processed)
     report = classification_report(y_test, tuned_pred, output_dict=True)
@@ -184,11 +218,6 @@ def main():
     precision = float(report["weighted avg"]["precision"])
     recall = float(report["weighted avg"]["recall"])
     f1 = float(report["weighted avg"]["f1-score"])
-
-    baseline_pred = tuned_pred
-    baseline_accuracy = accuracy
-    baseline_f1 = f1
-    baseline_report = report
 
     strength = "Best at separating Investment-Low and Speculative classes in the balanced tree."
     weakness = "Distressed is still the hardest class because the dataset is small and imbalanced."
@@ -368,7 +397,8 @@ def main():
                 [item["feature"], round(item["value"], 4)]
                 for item in shap_features
             ],
-            "shapStory": shap_story
+            "shapStory": shap_story,
+            "fairBaseline": fair_baseline["metrics"] if fair_baseline else None
         }
     }
 

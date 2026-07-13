@@ -9,23 +9,26 @@ reports **grouped, stratified k-fold cross-validation** — the honest, stable
 performance number to cite.
 
 Methodological alignment with the dashboard (predict_xgboost.py):
-- Same model: train_model() (SMOTE oversampling + 5-seed XGBoost soft-voting
-  ensemble with the same regularised hyperparameter grid) is imported from
-  predict_xgboost.py and used unmodified here, so the CV number and the
+- Same model: train_model() (SMOTE oversampling + seeded XGBoost soft-voting
+  ensemble blended with the ordinal cumulative-link view, §16.26) is imported
+  from predict_xgboost.py and used unmodified here, so the CV number and the
   dashboard's single-split demo number are measuring the *same* model, not
   two different pipelines that happen to share a name.
-- Same threshold protocol: threshold optimisation and the use/don't-use
-  decision are performed with fit_thresholds_nested() -- a company-level
-  inner train/validation split carved out of each outer TRAINING fold only.
-  The outer test fold is never touched until the single final scoring call.
-  This mirrors exactly what the dashboard does for its single split.
+- Same prediction rule: plain argmax over the blended probabilities. The
+  nested threshold-multiplier protocol and the second-stage corrector were
+  removed in §16.26 after both were measured to reduce the blended
+  ensemble's accuracy and macro-F1.
 
 Key properties:
 - Company-level grouping (StratifiedGroupKFold on Symbol/Name): no company
   appears in both the training and the held-out fold, so there is no
   company-level leakage.
-- Per-fold preprocessing: imputation, winsorization, sector z-scores, and
-  feature selection are all fit on the training fold only.
+- Per-fold preprocessing: missingness-indicator columns, sector z-scores,
+  categorical dtype casting, and feature selection are all fit on the
+  training fold only. No imputation and no winsorisation — see
+  preprocessing.py's module docstring for why those don't belong in a
+  tree-based pipeline; NaN passes through for XGBoost's native missing-value
+  split handling.
 - Results (per-fold and mean/std) are persisted to xgboost_cv_metrics.json so
   the dashboard can display the CV mean ± std as the primary, authoritative
   accuracy figure without re-running this expensive CV on every request.
@@ -49,24 +52,22 @@ from preprocessing import (
     RANDOM_STATE,
     DROP_COLS,
     add_interaction_features,
-    apply_imputation,
+    align_features,
+    apply_categorical_dtypes,
+    apply_missingness_indicators,
     apply_zscore_from_stats,
     clean_dataframe,
     compute_sector_stats,
-    encode_and_align,
     extract_groups,
+    fit_categorical_dtypes,
     fit_feature_selection,
-    fit_imputation,
+    fit_missingness_indicators,
     group_rating,
-    winsorize_features,
 )
 from predict_xgboost import (
     DEFAULT_DATASET_PATH,
     RESULTS_DIR,
-    apply_second_stage,
-    fit_thresholds_nested,
     train_model,
-    train_second_stage_classifier,
 )
 
 warnings.filterwarnings("ignore")
@@ -76,21 +77,24 @@ CV_METRICS_JSON_PATH = RESULTS_DIR / "xgboost_cv_metrics.json"
 
 def preprocess_fold(X_train, X_test):
     """Fit all transforms on the training fold, apply to both (leakage-free)."""
-    medians = fit_imputation(X_train)
-    X_train = apply_imputation(X_train, medians)
-    X_test = apply_imputation(X_test, medians)
+    indicator_cols = fit_missingness_indicators(X_train)
+    X_train = apply_missingness_indicators(X_train, indicator_cols)
+    X_test = apply_missingness_indicators(X_test, indicator_cols)
 
-    X_train_w, X_test_w, _ = winsorize_features(X_train, X_test)
-    X_train_i = add_interaction_features(X_train_w)
-    X_test_i = add_interaction_features(X_test_w)
+    X_train_i = add_interaction_features(X_train)
+    X_test_i = add_interaction_features(X_test)
 
     if "Sector" in X_train_i.columns:
         stats = compute_sector_stats(X_train_i)
         apply_zscore_from_stats([X_train_i, X_test_i], stats)
 
-    X_train_enc, X_test_enc = encode_and_align(X_train_i, X_test_i)
+    categories = fit_categorical_dtypes(X_train_i)
+    X_train_cat = apply_categorical_dtypes(X_train_i, categories)
+    X_test_cat = apply_categorical_dtypes(X_test_i, categories)
+
+    X_train_enc, X_test_enc = align_features(X_train_cat, X_test_cat)
     selected = fit_feature_selection(X_train_enc)
-    return X_train_enc[selected], X_test_enc.reindex(columns=selected, fill_value=0)
+    return X_train_enc[selected], X_test_enc.reindex(columns=selected)
 
 
 def main():
@@ -118,7 +122,6 @@ def main():
     train_accs, train_macro_f1s = [], []
     per_class_f1 = {c: [] for c in LABEL_ENCODER.classes_}
     fold_records = []
-    thresholds_used_count = 0
 
     # Per-sector breakdown: accumulates (true, predicted) label pairs across
     # every fold's OUTER TEST predictions only, keyed by raw Sector value.
@@ -145,36 +148,16 @@ def main():
 
         X_tr_enc, X_te_enc = preprocess_fold(X_tr, X_te)
 
-        # Same model as the dashboard: SMOTE + 5-seed XGBoost soft-voting
-        # ensemble, identical hyperparameter grid (train_model imported
+        # Same model as the dashboard: SMOTE + XGBoost soft-voting ensemble
+        # blended with the ordinal cumulative-link view (train_model imported
         # directly from predict_xgboost.py -- one implementation, not two).
-        best_xgb, ensemble, best_params = train_model(X_tr_enc, y_tr)
+        # Plain argmax over the blended probabilities: the nested threshold
+        # multipliers and second-stage corrector were removed in §16.26 (both
+        # reduced the blended ensemble's accuracy and macro-F1).
+        best_xgb, ensemble, best_params = train_model(X_tr_enc, y_tr, train_groups=groups_tr)
 
-        # Same threshold protocol as the dashboard: fit + decide on a
-        # company-level inner validation slice carved out of THIS fold's
-        # training data only. The outer test fold (X_te_enc/y_te) is not
-        # touched until the scoring call below.
-        thresholds, use_thresholds = fit_thresholds_nested(
-            X_tr_enc, y_tr, groups_tr, best_params, n_classes=n_classes,
-        )
-        if use_thresholds:
-            thresholds_used_count += 1
-
-        proba_te = ensemble.predict_proba(X_te_enc)
-        proba_tr = ensemble.predict_proba(X_tr_enc)
-        preds = (proba_te * thresholds).argmax(axis=1) if use_thresholds else proba_te.argmax(axis=1)
-        train_preds = (proba_tr * thresholds).argmax(axis=1) if use_thresholds else proba_tr.argmax(axis=1)
-
-        # Same second-stage Speculative/Distressed correction as the
-        # dashboard (predict_xgboost.py): fit exclusively on this fold's
-        # training data, then applied to both the outer test fold's
-        # predictions and (for the train/test-gap diagnostic) the training
-        # fold's own predictions. Imported directly from predict_xgboost.py
-        # so CV and the dashboard cannot silently diverge (see the
-        # methodological-alignment fix this file's docstring describes).
-        second_stage_model = train_second_stage_classifier(X_tr_enc, y_tr)
-        preds = apply_second_stage(preds, X_te_enc, second_stage_model)
-        train_preds = apply_second_stage(train_preds, X_tr_enc, second_stage_model)
+        preds = ensemble.predict_proba(X_te_enc).argmax(axis=1)
+        train_preds = ensemble.predict_proba(X_tr_enc).argmax(axis=1)
 
         # Accumulate per-sector (true, predicted) pairs for this fold's test
         # rows into the running cross-fold collection.
@@ -210,13 +193,11 @@ def main():
             "train_test_gap": round(float(gap), 4),
             "train_macro_f1": round(float(train_macro), 4),
             "test_macro_f1": round(float(macro), 4),
-            "used_thresholds": bool(use_thresholds),
         })
         print(
             f"fold {i}/{n_splits}: n_train={len(y_tr)} n_test={len(y_te)} "
             f"train_acc={train_acc:.4f} test_acc={acc:.4f} gap={gap:.4f} "
-            f"train_macroF1={train_macro:.4f} test_macroF1={macro:.4f} "
-            f"used_thresholds={use_thresholds}",
+            f"train_macroF1={train_macro:.4f} test_macroF1={macro:.4f}",
             flush=True,
         )
 
@@ -321,8 +302,8 @@ def main():
     lines = [
         f"cv_folds: {n_splits}",
         "split: grouped_stratified (company-level, leakage-safe)",
-        f"threshold_protocol: nested company-level inner split per fold "
-        f"(used in {thresholds_used_count}/{n_splits} folds)",
+        "prediction_rule: plain argmax over blended softmax+ordinal probabilities "
+        "(threshold multipliers and second-stage corrector removed, see report §16.26)",
         f"train_accuracy_mean: {train_accs.mean():.4f}",
         f"train_accuracy_std: {train_accs.std():.4f}",
         f"test_accuracy_mean: {accs.mean():.4f}",
@@ -363,8 +344,7 @@ def main():
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "cv_folds": n_splits,
         "split_strategy": "grouped_stratified",
-        "threshold_protocol": "nested_company_level_inner_split",
-        "thresholds_used_in_folds": thresholds_used_count,
+        "prediction_rule": "argmax_blended_softmax_ordinal",
         "test_accuracy_mean": round(float(accs.mean()), 4),
         "test_accuracy_std": round(float(accs.std()), 4),
         "train_accuracy_mean": round(float(train_accs.mean()), 4),

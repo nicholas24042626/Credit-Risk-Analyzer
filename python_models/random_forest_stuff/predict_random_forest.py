@@ -7,6 +7,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from shared_baseline import extract_groups, make_split, run_fair_baseline  # noqa: E402
+
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
@@ -14,7 +17,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
@@ -238,23 +241,18 @@ def build_pipeline(X):
         fail("The dataset does not contain usable feature columns.")
 
     preprocessor = ColumnTransformer(transformers=transformers)
+    # class_weight="balanced" + random_state are set here since they're not
+    # hyperparameters worth searching (balanced weighting is the deliberate
+    # imbalance strategy, not a tunable choice); everything else is searched
+    # over in main() via RandomizedSearchCV rather than hand-picked here.
     return Pipeline(steps=[
         ("preprocessor", preprocessor),
         ("model", RandomForestClassifier(
-            n_estimators=300,
-            min_samples_leaf=2,
             class_weight="balanced",
             random_state=RANDOM_STATE,
             n_jobs=1
         ))
     ])
-
-
-def choose_split_options(y):
-    class_counts = y.value_counts()
-    can_stratify = len(class_counts) > 1 and int(class_counts.min()) >= 2
-    test_size = 0.2 if len(y) >= 10 else 0.3
-    return test_size, y if can_stratify else None
 
 
 def feature_importance(best_model, X_test, y_test):
@@ -294,8 +292,22 @@ def main():
     if df.empty:
         fail("The uploaded dataset is empty.")
 
+    # Shared cross-model comparison tier: identical cleaning, split, features,
+    # and untuned-default estimator as the other three models' own
+    # fairBaseline (see shared_baseline.py). Only meaningful when the dataset
+    # actually has the standard "Rating" column -- this script otherwise
+    # accepts arbitrary target columns, which the shared baseline does not.
+    fair_baseline = run_fair_baseline(RandomForestClassifier(random_state=RANDOM_STATE), df) \
+        if "Rating" in df.columns else None
+
     y, valid_mask, target_column = build_target(df, payload)
     df = df.loc[valid_mask].copy()
+
+    # Company-level grouping key, captured before Name/Symbol are dropped
+    # below (None if the dataset has no Symbol/Name column -- e.g. a
+    # user-uploaded file with a non-standard schema -- in which case
+    # make_split() falls back to plain stratified splitting).
+    groups = extract_groups(df)
 
     drop_cols = [
         target_column,
@@ -313,17 +325,37 @@ def main():
     if y.nunique() < 2:
         fail("The target column must contain at least two classes.")
 
-    test_size, stratify = choose_split_options(y)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=test_size,
-        random_state=RANDOM_STATE,
-        stratify=stratify
+    # Company-level grouped split (not plain stratify=y): a company's repeat
+    # year-rows must land entirely on one side of the split, or accuracy is
+    # inflated by the model training on near-duplicate rows of a company that
+    # also appears in the test set. test_size=0.20 matches this script's
+    # previous 80/20 default for datasets of reasonable size.
+    X_train, X_test, y_train, y_test, split_strategy = make_split(
+        X, y, groups=groups, test_size=0.20, random_state=RANDOM_STATE
     )
 
-    model = build_pipeline(X)
-    model.fit(X_train, y_train)
+    # Small randomized search over Random Forest's own highest-impact
+    # hyperparameters (previously fixed at hand-picked n_estimators=300,
+    # min_samples_leaf=2 with no search at all).
+    pipeline = build_pipeline(X)
+    param_distributions = {
+        "model__n_estimators": [100, 200, 300, 400],
+        "model__max_depth": [None, 5, 10, 20, 30],
+        "model__min_samples_leaf": [1, 2, 4, 8],
+        "model__min_samples_split": [2, 5, 10],
+        "model__max_features": ["sqrt", "log2"],
+    }
+    search = RandomizedSearchCV(
+        estimator=pipeline,
+        param_distributions=param_distributions,
+        n_iter=12,
+        cv=3,
+        scoring="f1_weighted",
+        random_state=RANDOM_STATE,
+        n_jobs=1,
+    )
+    search.fit(X_train, y_train)
+    model = search.best_estimator_
     predictions = model.predict(X_test)
 
     labels = list(model.named_steps["model"].classes_)
@@ -403,7 +435,8 @@ def main():
             "shapStory": {
                 "positive": positive,
                 "negative": negative
-            }
+            },
+            "fairBaseline": fair_baseline["metrics"] if fair_baseline else None
         }
     }
 

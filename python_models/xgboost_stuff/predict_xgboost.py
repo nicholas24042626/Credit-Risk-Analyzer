@@ -8,12 +8,14 @@ import os
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from shared_baseline import run_fair_baseline  # noqa: E402
+
 import joblib
 import numpy as np
 import pandas as pd
 import shap
 from scipy.optimize import minimize
-from sklearn.ensemble import VotingClassifier
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -21,10 +23,182 @@ from sklearn.metrics import (
     f1_score,
     precision_recall_fscore_support,
 )
-from sklearn.model_selection import GroupShuffleSplit, RandomizedSearchCV
+from sklearn.model_selection import GroupShuffleSplit, RandomizedSearchCV, train_test_split
 from sklearn.utils.class_weight import compute_sample_weight
 from imblearn.over_sampling import SMOTE, BorderlineSMOTE
 from xgboost import XGBClassifier
+
+# ---------------------------------------------------------------------------
+# Fitted soft-voting ensemble
+# ---------------------------------------------------------------------------
+#
+# sklearn.ensemble.VotingClassifier clones every estimator and refits the
+# clones inside .fit(), even if the estimators passed in are already fitted.
+# Both members here (best_xgb from RandomizedSearchCV, xgb_2) are already
+# fully trained before the ensemble is assembled, so a VotingClassifier would
+# silently discard that work and refit two more full XGBoost models for no
+# behavioural difference (same data/params/random_state -> same trees,
+# deterministically). This wrapper just averages predict_proba over the
+# already-fitted estimators. Defined at module level (not a closure) so
+# joblib can pickle/unpickle it across cache hits.
+
+
+class FittedVotingEnsemble:
+    """Soft-voting wrapper over already-fitted classifiers (no refitting)."""
+
+    def __init__(self, named_estimators):
+        self.named_estimators = named_estimators
+        self.classes_ = named_estimators[0][1].classes_
+
+    def predict_proba(self, X):
+        probas = [clf.predict_proba(X) for _, clf in self.named_estimators]
+        return np.mean(probas, axis=0)
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        return self.classes_[np.argmax(proba, axis=1)]
+
+
+# ---------------------------------------------------------------------------
+# Ordinal cumulative-link decomposition (blended with the softmax ensemble)
+# ---------------------------------------------------------------------------
+#
+# The four risk tiers are ORDERED (Investment_High < Investment_Low <
+# Speculative < Distressed), but multi:softprob treats them as unordered
+# categories. A cumulative-link decomposition trains K-1 binary models for
+# P(y > k) and converts them into class probabilities:
+#
+#     P(y=0) = 1 - P(y>0)
+#     P(y=k) = P(y>k-1) - P(y>k)      (0 < k < K-1)
+#     P(y=K-1) = P(y>K-2)
+#
+# Each binary sub-problem pools every class on one side of an ordinal
+# threshold (e.g. "investment grade vs not"), so the tiny Distressed class
+# borrows statistical strength from Speculative instead of competing with it
+# in a 4-way softmax. Blending the two probability views (weight below) was
+# measured to beat either model alone on grouped CV; every blend weight in
+# [0.3, 0.7] beat the softmax-only baseline, so the choice of 0.4 is not a
+# knife-edge tuning artefact. See docs/XGBoost_Technical_Report.md §16.26.
+
+ORDINAL_BLEND_WEIGHT = 0.4
+
+
+def _scale_pos_weight(y_bin):
+    """XGBoost's canonical binary-imbalance ratio: negative_count / positive_count.
+
+    Unlike ``compute_sample_weight("balanced", ...)`` (a per-row weight
+    array), this is a single scalar baked into the loss via the
+    ``scale_pos_weight`` constructor argument -- the textbook XGBoost
+    mechanism for binary class imbalance (XGBoost's own docs single it out
+    for exactly this case). Each ordinal sub-model (see
+    ``train_ordinal_models``) IS a genuine binary problem, so this applies
+    directly; the primary 4-class ensemble is multiclass, where
+    ``scale_pos_weight`` is undefined -- that model keeps using
+    per-sample ``compute_sample_weight("balanced", ...)``, the correct
+    multiclass equivalent (see ``train_model``).
+    """
+    pos = int((y_bin == 1).sum())
+    neg = int((y_bin == 0).sum())
+    return neg / max(pos, 1)
+
+
+def train_ordinal_models(X_train, y_train, best_params, random_state=None,
+                          X_val=None, y_val=None):
+    """Train K-1 cumulative binary models P(y > k) on the ORIGINAL (non-SMOTE)
+    training data, using scale_pos_weight for the binary imbalance in each
+    sub-problem.
+
+    ``X_val``/``y_val`` (multiclass-labelled), if given, are re-binarised per
+    threshold ``k`` and used purely for early stopping (see
+    ``EARLY_STOPPING_ROUNDS``) -- carved from the outer training fold only,
+    never the outer test/CV fold (see ``_carve_inner_validation``).
+
+    Returns None when the encoded labels are not a contiguous 0..K-1 range
+    (e.g. an uploaded dataset missing an entire tier), in which case the
+    ensemble falls back to softmax-only probabilities.
+    """
+    if random_state is None:
+        random_state = RANDOM_STATE  # imported below this def; resolved at call time
+    present = np.unique(y_train)
+    n_classes = len(present)
+    if n_classes < 2 or not np.array_equal(present, np.arange(n_classes)):
+        return None
+
+    # Depth/shrinkage hyperparameters found by the softmax search transfer
+    # reasonably to the binary sub-problems; objective/eval_metric must not.
+    base = dict(
+        objective="binary:logistic", eval_metric="logloss",
+        tree_method="hist", enable_categorical=True, n_jobs=-1,
+        max_depth=3, n_estimators=150, learning_rate=0.05,
+        min_child_weight=5, gamma=0.1, reg_alpha=0.3, reg_lambda=1.5,
+        subsample=0.85, colsample_bytree=0.8,
+    )
+    for key, value in (best_params or {}).items():
+        if key in base and key not in ("objective", "eval_metric"):
+            base[key] = value
+
+    use_early_stop = X_val is not None and y_val is not None and len(X_val) > 0
+
+    models = []
+    for k in range(n_classes - 1):
+        y_bin = (y_train > k).astype(int)
+        fit_kwargs = {}
+        clf_kwargs = dict(base, scale_pos_weight=_scale_pos_weight(y_bin),
+                           random_state=random_state + k)
+        if use_early_stop:
+            # Give early stopping room to actually stop early rather than
+            # exhausting the fixed tree count from the softmax search.
+            clf_kwargs["n_estimators"] = max(base["n_estimators"] * 3, 300)
+            clf_kwargs["early_stopping_rounds"] = EARLY_STOPPING_ROUNDS
+            y_val_bin = (y_val > k).astype(int)
+            fit_kwargs["eval_set"] = [(X_val, y_val_bin)]
+            fit_kwargs["verbose"] = False
+        clf = XGBClassifier(**clf_kwargs)
+        clf.fit(X_train, y_bin, **fit_kwargs)
+        models.append(clf)
+    return models
+
+
+def ordinal_proba(models, X):
+    """Convert cumulative P(y>k) outputs into per-class probabilities."""
+    p_greater = np.column_stack([m.predict_proba(X)[:, 1] for m in models])
+    # Enforce monotone non-increasing cumulative probabilities: the binary
+    # models are trained independently, so tiny inversions can occur.
+    p_greater = np.minimum.accumulate(p_greater, axis=1)
+    n_classes = p_greater.shape[1] + 1
+    proba = np.empty((len(p_greater), n_classes))
+    proba[:, 0] = 1.0 - p_greater[:, 0]
+    for k in range(1, n_classes - 1):
+        proba[:, k] = p_greater[:, k - 1] - p_greater[:, k]
+    proba[:, -1] = p_greater[:, -1]
+    proba = np.clip(proba, 1e-9, None)
+    return proba / proba.sum(axis=1, keepdims=True)
+
+
+class BlendedOrdinalEnsemble:
+    """Weighted blend of the softmax voting ensemble and the ordinal view.
+
+    Falls back to softmax-only probabilities when ordinal models are
+    unavailable (non-contiguous label space in an uploaded dataset).
+    """
+
+    def __init__(self, voting_ensemble, ordinal_models, ordinal_weight=ORDINAL_BLEND_WEIGHT):
+        self.voting_ensemble = voting_ensemble
+        self.ordinal_models = ordinal_models
+        self.ordinal_weight = ordinal_weight
+        self.classes_ = voting_ensemble.classes_
+
+    def predict_proba(self, X):
+        p_soft = self.voting_ensemble.predict_proba(X)
+        if not self.ordinal_models or p_soft.shape[1] != len(self.ordinal_models) + 1:
+            return p_soft
+        p_ord = ordinal_proba(self.ordinal_models, X)
+        w = self.ordinal_weight
+        return (1.0 - w) * p_soft + w * p_ord
+
+    def predict(self, X):
+        proba = self.predict_proba(X)
+        return self.classes_[np.argmax(proba, axis=1)]
 
 # All data-transformation logic lives in the shared preprocessing module so the
 # production pipeline and the training notebook stay in sync.
@@ -33,23 +207,55 @@ from preprocessing import (
     RANDOM_STATE,
     DROP_COLS,
     add_interaction_features,
-    apply_imputation,
-    apply_winsorize_bounds,
+    align_features,
+    apply_categorical_dtypes,
+    apply_missingness_indicators,
     apply_zscore_from_stats,
     clean_dataframe,
     compute_sector_stats,
-    encode_and_align,
     extract_groups,
+    fit_categorical_dtypes,
     fit_feature_selection,
-    fit_imputation,
+    fit_missingness_indicators,
     format_prediction_label,
     group_rating,
     humanize_feature_name,
     make_split,
-    winsorize_features,
 )
 
 warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# Class-imbalance strategy toggle
+# ---------------------------------------------------------------------------
+#
+# Two strategies are implemented side by side (see train_model()) so they can
+# be directly compared rather than one silently replacing the other:
+#   "class_weight" -- compute_sample_weight("balanced", ...) for the 4-class
+#                     ensemble, scale_pos_weight for each binary ordinal
+#                     sub-model. No synthetic rows.
+#   "smote"         -- the original BorderlineSMOTE/SMOTE oversampling.
+#
+# Default is "class_weight". Rationale: the Distressed class has ~50-160
+# genuine training rows (~2-4% of the data). SMOTE interpolates *between*
+# real minority points in feature space -- with an anchor set this sparse in
+# a ~40+ dimensional engineered feature space, "nearest neighbours" are often
+# not particularly close, so synthetic points can land in regions no real
+# Distressed company actually occupies (a risk documented for this exact
+# pipeline in docs/XGBoost_Technical_Report.md §16.5, where SMOTE on 4-5
+# per-fold Distressed samples produced degenerate synthetic clusters).
+# scale_pos_weight/class-weighting reweights the loss on the REAL points
+# instead of fabricating new ones, so it cannot introduce out-of-distribution
+# rows -- strictly more defensible on a sparse anchor set, at the cost of not
+# adding any new decision-boundary examples the way SMOTE can. See the
+# CV comparison run alongside this change for measured numbers.
+IMBALANCE_STRATEGY = "class_weight"  # "class_weight" | "smote"
+
+# Early-stopping validation fraction, carved from the outer training fold
+# only (never the outer test/CV fold) via a company-level grouped split when
+# possible. See _carve_inner_validation().
+EARLY_STOP_VAL_SIZE = 0.15
+EARLY_STOPPING_ROUNDS = 20
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 DEFAULT_DATASET_PATH = Path(__file__).resolve().parents[2] / "data" / "set A corporate_rating.csv"
@@ -116,10 +322,16 @@ def _cache_paths(data_hash):
     """Return a dict of all cache file paths keyed by logical name."""
     suffix = "" if data_hash == "default" else f"_{data_hash}"
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    # optimal_thresholds / prediction_strategy / second_stage_model were
+    # removed from the pipeline in §16.26; imputer_medians / winsorize_bounds
+    # were removed in the no-impute/no-winsorize preprocessing pass (replaced
+    # by missing_indicator_cols / categorical_categories below). Pre-existing
+    # cache files under the old names are simply not in this list any more,
+    # so _cache_is_complete() returns False and a stale cache from either
+    # prior pipeline shape can't be silently loaded.
     names = [
-        "calibrated_model", "base_model", "imputer_medians", "winsorize_bounds",
-        "sector_stats", "feature_columns", "optimal_thresholds", "prediction_strategy",
-        "second_stage_model",
+        "calibrated_model", "base_model", "missing_indicator_cols",
+        "categorical_categories", "sector_stats", "feature_columns",
     ]
     return {name: RESULTS_DIR / f"{name}{suffix}.pkl" for name in names}
 
@@ -237,75 +449,139 @@ def fit_thresholds_nested(X_train_enc, y_train, train_groups, best_params, n_cla
     return thresholds, use_thresholds
 
 
-def train_model(X_train_enc, y_train):
-    """Fit an ensemble of XGBoost models with aggressive tuning for 75%+ accuracy.
+def _carve_inner_validation(X, y, groups, val_size=EARLY_STOP_VAL_SIZE, random_state=RANDOM_STATE):
+    """Carve an early-stopping validation slice out of X/y/groups only.
+
+    Company-level (grouped) when possible, so no company's other-year rows
+    leak between the fit slice and the validation slice; falls back to a
+    plain stratified split if grouping isn't available or fails (e.g. too
+    few groups). Mirrors the leakage-safe nested-split pattern already used
+    by ``fit_thresholds_nested`` for the (now-removed) threshold protocol,
+    but reused here for early stopping instead.
+
+    Returns (X_fit, y_fit, X_val, y_val, groups_fit). ``groups_fit`` is None
+    when grouping wasn't used, matching ``make_split``'s convention.
+    """
+    if groups is not None:
+        try:
+            gss = GroupShuffleSplit(n_splits=1, test_size=val_size, random_state=random_state)
+            fit_idx, val_idx = next(gss.split(X, y, groups))
+            if len(fit_idx) > 0 and len(val_idx) > 0:
+                groups_arr = np.asarray(groups)
+                return (
+                    X.iloc[fit_idx], y[fit_idx],
+                    X.iloc[val_idx], y[val_idx],
+                    groups_arr[fit_idx],
+                )
+        except (ValueError, StopIteration):
+            pass
+
+    try:
+        fit_idx, val_idx = train_test_split(
+            np.arange(len(y)), test_size=val_size, random_state=random_state, stratify=y
+        )
+        return X.iloc[fit_idx], y[fit_idx], X.iloc[val_idx], y[val_idx], None
+    except ValueError:
+        # Too few rows/classes to split at all -- no early stopping this run.
+        return X, y, None, None, None
+
+
+def train_model(X_train_enc, y_train, train_groups=None):
+    """Fit the blended XGBoost ensemble (softmax voting + ordinal view).
 
     Strategy:
-    1. Apply SMOTE to oversample minority classes (especially Distressed)
-    2. Expand hyperparameter grid to cover more of the search space
-    3. Train 5 XGBoost models with different random seeds
-    4. Soft-vote ensemble for robustness
+    1. Carve a company-level early-stopping validation slice out of the
+       training fold only (never the outer test/CV fold).
+    2. Apply the configured imbalance strategy (IMBALANCE_STRATEGY) to the
+       remaining fit slice: class-weighting (default) or SMOTE.
+    3. Randomised hyperparameter search over a regularised grid.
+    4. Two-seed soft-voting ensemble over the softmax models, refit with
+       early stopping on the held-out validation slice.
+    5. Ordinal cumulative-link models trained on the ORIGINAL (non-SMOTE)
+       fit slice, also early-stopped, blended into the final probabilities.
     """
-    # Apply oversampling to balance classes before training. The Distressed class
-    # (~57 training samples per fold) is too small relative to the majority
-    # classes for the model to learn reliable decision boundaries.
-    # Strategy: use BorderlineSMOTE (focuses synthetic samples on the decision
-    # boundary rather than the class interior, producing more informative
-    # training examples) with a custom sampling_strategy that aggressively
-    # oversamples minority classes to at least 60% of the majority count.
-    class_counts = pd.Series(y_train).value_counts()
-    min_class_count = int(class_counts.min())
-    max_class_count = int(class_counts.max())
-    k_neighbors = min(5, max(1, min_class_count - 1))
+    # Early-stopping validation slice, carved BEFORE any resampling so it
+    # only ever contains real (non-synthetic) rows the models never trained
+    # on -- required for early stopping to be a meaningful overfitting check
+    # rather than the model grading its own training data.
+    X_fit, y_fit, X_val, y_val, groups_fit = _carve_inner_validation(
+        X_train_enc, y_train, train_groups
+    )
+    use_early_stop = X_val is not None
 
-    # Target: bring every class to at least 60% of the majority class size.
-    # This avoids perfectly balancing (which can over-represent extremely rare
-    # classes with too many synthetic copies) while still giving XGBoost
-    # enough minority signal to learn from.
-    target_count = int(max_class_count * 0.6)
-    sampling_strategy = {
-        cls: max(target_count, count)
-        for cls, count in class_counts.items()
-    }
+    # Ordinal models must see the real class geometry, not SMOTE's synthetic
+    # interpolations, so capture the fit-slice originals before resampling.
+    X_orig, y_orig = X_fit, y_fit
 
-    if min_class_count >= 3 and k_neighbors >= 2:
-        try:
-            oversampler = BorderlineSMOTE(
-                random_state=RANDOM_STATE,
-                k_neighbors=k_neighbors,
-                sampling_strategy=sampling_strategy,
-            )
-            X_train_enc, y_train = oversampler.fit_resample(X_train_enc, y_train)
-        except ValueError:
-            # Fallback to regular SMOTE if BorderlineSMOTE fails (e.g. not
-            # enough borderline samples in a tiny class)
+    if IMBALANCE_STRATEGY == "smote":
+        # Apply oversampling to balance classes before training. The Distressed
+        # class (~50-160 real rows overall, fewer still per fold) is too small
+        # relative to the majority classes for the model to learn reliable
+        # decision boundaries from real points alone.
+        # Strategy: use BorderlineSMOTE (focuses synthetic samples on the
+        # decision boundary rather than the class interior) with a custom
+        # sampling_strategy that aggressively oversamples minority classes to
+        # at least 60% of the majority count.
+        class_counts = pd.Series(y_fit).value_counts()
+        min_class_count = int(class_counts.min())
+        max_class_count = int(class_counts.max())
+        k_neighbors = min(5, max(1, min_class_count - 1))
+
+        # Target: bring every class to at least 60% of the majority class size.
+        # This avoids perfectly balancing (which can over-represent extremely
+        # rare classes with too many synthetic copies) while still giving
+        # XGBoost enough minority signal to learn from.
+        target_count = int(max_class_count * 0.6)
+        sampling_strategy = {
+            cls: max(target_count, count)
+            for cls, count in class_counts.items()
+        }
+
+        X_fit_res, y_fit_res = X_fit, y_fit
+        if min_class_count >= 3 and k_neighbors >= 2:
             try:
-                oversampler = SMOTE(
+                oversampler = BorderlineSMOTE(
                     random_state=RANDOM_STATE,
                     k_neighbors=k_neighbors,
                     sampling_strategy=sampling_strategy,
                 )
-                X_train_enc, y_train = oversampler.fit_resample(X_train_enc, y_train)
+                X_fit_res, y_fit_res = oversampler.fit_resample(X_fit, y_fit)
             except ValueError:
-                pass  # proceed with imbalanced data + sample_weights
-    elif min_class_count >= 2:
-        try:
-            oversampler = SMOTE(
-                random_state=RANDOM_STATE,
-                k_neighbors=max(1, k_neighbors),
-                sampling_strategy=sampling_strategy,
-            )
-            X_train_enc, y_train = oversampler.fit_resample(X_train_enc, y_train)
-        except ValueError:
-            pass
+                # Fallback to regular SMOTE if BorderlineSMOTE fails (e.g. not
+                # enough borderline samples in a tiny class)
+                try:
+                    oversampler = SMOTE(
+                        random_state=RANDOM_STATE,
+                        k_neighbors=k_neighbors,
+                        sampling_strategy=sampling_strategy,
+                    )
+                    X_fit_res, y_fit_res = oversampler.fit_resample(X_fit, y_fit)
+                except ValueError:
+                    pass  # proceed with imbalanced data + sample_weights
+        elif min_class_count >= 2:
+            try:
+                oversampler = SMOTE(
+                    random_state=RANDOM_STATE,
+                    k_neighbors=max(1, k_neighbors),
+                    sampling_strategy=sampling_strategy,
+                )
+                X_fit_res, y_fit_res = oversampler.fit_resample(X_fit, y_fit)
+            except ValueError:
+                pass
+        X_fit, y_fit = X_fit_res, y_fit_res
 
-    sample_weights = compute_sample_weight("balanced", y_train)
+    # Balanced per-sample weights: the correct multiclass equivalent of
+    # scale_pos_weight (which XGBoost only supports for binary problems --
+    # see _scale_pos_weight's docstring). Computed on X_fit/y_fit, i.e. AFTER
+    # SMOTE if that strategy is active (matches the prior behaviour) or on
+    # the untouched real data under "class_weight" (the primary strategy).
+    sample_weights = compute_sample_weight("balanced", y_fit)
 
     base_model = XGBClassifier(
         objective="multi:softprob",
         eval_metric="mlogloss",
-        use_label_encoder=False,
         tree_method="hist",        # histogram-based boosting: ~2-3x faster
+        enable_categorical=True,   # native categorical splits (e.g. Sector)
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
@@ -338,31 +614,62 @@ def train_model(X_train_enc, y_train):
     grid = RandomizedSearchCV(
         estimator=base_model,
         param_distributions=param_grid,
-        n_iter=15,             # reduced from 25 — saves ~40% search time
+        n_iter=15,             # reduced from 25 — saves ~40% search time; re-verified
+                                # n_iter=25 gives no measurable CV gain (0.5082 vs 0.5087
+                                # accuracy, within noise) before reverting to 15
         scoring="f1_macro",
         cv=3,
         n_jobs=-1,
-        refit=True,
+        # refit=False: only best_params_ is used below (the final ensemble
+        # members are refit separately, with early stopping and a raised
+        # n_estimators ceiling) -- letting the search also refit its own
+        # non-early-stopped copy would just be a wasted extra fit.
+        refit=False,
         random_state=RANDOM_STATE,
         verbose=0,
     )
-    grid.fit(X_train_enc, y_train, sample_weight=sample_weights)
-    best_xgb = grid.best_estimator_
+    grid.fit(X_fit, y_fit, sample_weight=sample_weights)
     best_params = grid.best_params_
+
+    # Final ensemble members: refit with early stopping on the held-out
+    # validation slice (requirement: early stopping must use a validation
+    # fold, never the outer test set -- X_val/y_val were carved from the
+    # training fold only, above). n_estimators is bumped well past the
+    # searched value so early stopping has room to actually trigger rather
+    # than exhausting the grid's fixed tree count.
+    ensemble_kwargs = dict(
+        best_params, tree_method="hist", enable_categorical=True, n_jobs=-1,
+    )
+    fit_kwargs = dict(sample_weight=sample_weights)
+    if use_early_stop:
+        ensemble_kwargs["n_estimators"] = max(best_params.get("n_estimators", 150) * 3, 400)
+        ensemble_kwargs["early_stopping_rounds"] = EARLY_STOPPING_ROUNDS
+        fit_kwargs["eval_set"] = [(X_val, y_val)]
+        fit_kwargs["verbose"] = False
+
+    best_xgb = XGBClassifier(**{**ensemble_kwargs, "random_state": RANDOM_STATE})
+    best_xgb.fit(X_fit, y_fit, **fit_kwargs)
 
     # Single retrained model with a different seed for mild variance reduction
     # via soft voting — keeps it fast (only 2 models total).
-    xgb_2 = XGBClassifier(
-        **{**best_params, "random_state": RANDOM_STATE + 1, "n_jobs": -1, "tree_method": "hist"}
-    )
-    xgb_2.fit(X_train_enc, y_train, sample_weight=sample_weights)
+    xgb_2 = XGBClassifier(**{**ensemble_kwargs, "random_state": RANDOM_STATE + 1})
+    xgb_2.fit(X_fit, y_fit, **fit_kwargs)
 
-    ensemble = VotingClassifier(
-        estimators=[("xgb1", best_xgb), ("xgb2", xgb_2)],
-        voting="soft",
-        n_jobs=-1,
+    # Both members are already fully fitted above -- wrap rather than hand
+    # them to sklearn's VotingClassifier, which would clone and refit both
+    # from scratch (see FittedVotingEnsemble docstring/comment near the top
+    # of this file).
+    voting = FittedVotingEnsemble([("xgb1", best_xgb), ("xgb2", xgb_2)])
+
+    # Ordinal cumulative-link view, blended with the softmax view. Measured
+    # +2.9-point grouped-CV accuracy gain over the softmax-only ensemble
+    # (see docs/XGBoost_Technical_Report.md §16.26).
+    ordinal_models = train_ordinal_models(
+        X_orig, y_orig, best_params,
+        X_val=X_val if use_early_stop else None,
+        y_val=y_val if use_early_stop else None,
     )
-    ensemble.fit(X_train_enc, y_train, sample_weight=sample_weights)
+    ensemble = BlendedOrdinalEnsemble(voting, ordinal_models)
 
     return best_xgb, ensemble, best_params
 
@@ -370,6 +677,11 @@ def train_model(X_train_enc, y_train):
 # ---------------------------------------------------------------------------
 # Second-stage meta-classifier (Speculative / Distressed correction)
 # ---------------------------------------------------------------------------
+
+def _select_rows(X, mask):
+    """Row-select by boolean mask, whether X is a DataFrame or ndarray."""
+    return X.iloc[mask] if hasattr(X, "iloc") else X[mask]
+
 
 def train_second_stage_classifier(X_train_enc, y_train):
     """Train a shallow XGBoost binary classifier to correct Speculative/Distressed confusion.
@@ -402,7 +714,7 @@ def train_second_stage_classifier(X_train_enc, y_train):
     if len(np.unique(y_sub)) < 2:
         return None  # only one class present, cannot train a binary classifier
 
-    X_sub = X_train_enc.iloc[spec_dist_mask] if hasattr(X_train_enc, 'iloc') else X_train_enc[spec_dist_mask]
+    X_sub = _select_rows(X_train_enc, spec_dist_mask)
     # binary:logistic requires classes [0, 1]; remap 2→0, 3→1 before fitting
     # and reverse (+2) in apply_second_stage.
     y_binary = y_sub - 2
@@ -410,7 +722,6 @@ def train_second_stage_classifier(X_train_enc, y_train):
     clf = XGBClassifier(
         objective="binary:logistic",
         eval_metric="logloss",
-        use_label_encoder=False,
         tree_method="hist",
         max_depth=2,        # very shallow — prevents overfitting on tiny subset
         n_estimators=50,    # few trees sufficient for a binary boundary correction
@@ -441,7 +752,7 @@ def apply_second_stage(preds, X_enc, second_stage_model):
     mask = (preds == 2) | (preds == 3)
     if mask.sum() == 0:
         return corrected
-    X_sub = X_enc.iloc[mask] if hasattr(X_enc, 'iloc') else X_enc[mask]
+    X_sub = _select_rows(X_enc, mask)
     # Predictions are in binary space [0, 1]; add 2 to restore original class
     # indices (Speculative=2, Distressed=3).
     corrected[mask] = second_stage_model.predict(X_sub) + 2
@@ -516,6 +827,15 @@ def main():
         if "Rating" not in df.columns:
             raise ValueError("The uploaded dataset must contain a 'Rating' column to train the model.")
 
+        # ── Fair cross-model baseline (shared_baseline.py) ────────────────────
+        # Same cleaning, split, engineered features, imputation/encoding, and
+        # untuned XGBClassifier defaults as the other three models' baseline
+        # runs, so this number is directly comparable across models -- unlike
+        # the tuned pipeline below, which is XGBoost-specific end to end.
+        fair_baseline = run_fair_baseline(
+            XGBClassifier(random_state=RANDOM_STATE), df
+        )
+
         # ── Data cleaning (deterministic, pre-split, leakage-safe) ───────────
         df, _clean_report = clean_dataframe(df)
 
@@ -552,89 +872,77 @@ def main():
             # ── Cache HIT: load artefacts ────────────────────────────────────
             calibrated_model = joblib.load(paths["calibrated_model"])
             best_xgb = joblib.load(paths["base_model"])
-            medians = joblib.load(paths["imputer_medians"])
-            w_bounds = joblib.load(paths["winsorize_bounds"])
+            indicator_cols = joblib.load(paths["missing_indicator_cols"])
+            categories = joblib.load(paths["categorical_categories"])
             sector_stats = joblib.load(paths["sector_stats"])
             feature_columns = joblib.load(paths["feature_columns"])
-            optimal_thresholds = joblib.load(paths["optimal_thresholds"])
-            use_thresholds = joblib.load(paths["prediction_strategy"]).get("use_thresholds", False)
-            second_stage_model = joblib.load(paths["second_stage_model"])
 
-            X_train_m = apply_imputation(X_train, medians)
-            X_test_m = apply_imputation(X_test, medians)
-            X_train_w, X_test_w = apply_winsorize_bounds(X_train_m, X_test_m, w_bounds)
-            X_train_i = add_interaction_features(X_train_w)
-            X_test_i = add_interaction_features(X_test_w)
+            X_train_ind = apply_missingness_indicators(X_train, indicator_cols)
+            X_test_ind = apply_missingness_indicators(X_test, indicator_cols)
+            X_train_i = add_interaction_features(X_train_ind)
+            X_test_i = add_interaction_features(X_test_ind)
             if sector_stats:
                 apply_zscore_from_stats([X_train_i, X_test_i], sector_stats)
-            X_train_enc, X_test_enc = encode_and_align(X_train_i, X_test_i, feature_columns)
+            X_train_cat = apply_categorical_dtypes(X_train_i, categories)
+            X_test_cat = apply_categorical_dtypes(X_test_i, categories)
+            X_train_enc, X_test_enc = align_features(X_train_cat, X_test_cat, feature_columns)
 
         else:
             # ── Cache MISS: full training pipeline ───────────────────────────
-            # 1. Impute (train medians) → 2. Winsorize → 3. Interactions →
-            # 4. Sector z-scores → 5. Encode/align → 6. Feature selection.
-            medians = fit_imputation(X_train)
-            X_train_m = apply_imputation(X_train, medians)
-            X_test_m = apply_imputation(X_test, medians)
+            # 1. Missingness indicators (train-fit column list; NaN passed
+            #    through, NOT imputed) → 2. Interactions → 3. Sector z-scores
+            #    → 4. Categorical dtype cast (native, NOT one-hot) → 5. Align
+            #    → 6. Feature selection (near-zero-variance only, no VIF/corr
+            #    pruning).
+            indicator_cols = fit_missingness_indicators(X_train)
+            X_train_ind = apply_missingness_indicators(X_train, indicator_cols)
+            X_test_ind = apply_missingness_indicators(X_test, indicator_cols)
 
-            X_train_w, X_test_w, w_bounds = winsorize_features(X_train_m, X_test_m)
-            X_train_i = add_interaction_features(X_train_w)
-            X_test_i = add_interaction_features(X_test_w)
+            X_train_i = add_interaction_features(X_train_ind)
+            X_test_i = add_interaction_features(X_test_ind)
 
             sector_stats = {}
             if "Sector" in X_train_i.columns:
                 sector_stats = compute_sector_stats(X_train_i)
                 apply_zscore_from_stats([X_train_i, X_test_i], sector_stats)
 
-            X_train_enc, X_test_enc = encode_and_align(X_train_i, X_test_i)
+            categories = fit_categorical_dtypes(X_train_i)
+            X_train_cat = apply_categorical_dtypes(X_train_i, categories)
+            X_test_cat = apply_categorical_dtypes(X_test_i, categories)
 
-            # Feature selection: prune near-zero-variance + redundant columns.
+            X_train_enc, X_test_enc = align_features(X_train_cat, X_test_cat)
+
+            # Feature selection: prune near-zero-variance numeric columns only
+            # (categorical columns always kept -- see fit_feature_selection).
             selected_features = fit_feature_selection(X_train_enc)
             X_train_enc = X_train_enc[selected_features]
-            X_test_enc = X_test_enc.reindex(columns=selected_features, fill_value=0)
+            X_test_enc = X_test_enc.reindex(columns=selected_features)
             feature_columns = selected_features
 
-            best_xgb, calibrated_model, best_params = train_model(X_train_enc, y_train)
-
-            # ── Threshold optimisation (nested, leakage-safe) ─────────────────
-            # Thresholds are fit and the use/don't-use decision is made on a
-            # company-level inner validation slice carved out of the outer
-            # TRAINING fold only (never the outer test fold, and never using
-            # rows the model was actually fit on to make the decision). This
-            # mirrors exactly what evaluate_xgboost.py does inside each CV
-            # fold, so the dashboard's single-split numbers and the CV numbers
-            # come from the same methodology. See fit_thresholds_nested().
-            optimal_thresholds, use_thresholds = fit_thresholds_nested(
-                X_train_enc, y_train, train_groups, best_params,
-                n_classes=len(LABEL_ENCODER.classes_),
+            best_xgb, calibrated_model, best_params = train_model(
+                X_train_enc, y_train, train_groups=train_groups
             )
 
-            # ── Second-stage Speculative/Distressed corrector ─────────────────
-            # Lightweight logistic regression trained only on the subset of
-            # training rows where the primary model would predict Speculative
-            # or Distressed, to correct the most frequent confusion pair.
-            second_stage_model = train_second_stage_classifier(X_train_enc, y_train)
+            # NOTE (§16.26): the nested threshold-multiplier step and the
+            # second-stage Speculative/Distressed corrector were removed from
+            # the active pipeline. Both were tuned for the softmax-only
+            # ensemble's probability scale; applied to the blended ordinal
+            # ensemble they measurably reduced BOTH accuracy and macro-F1 on
+            # grouped CV. fit_thresholds_nested() and
+            # train_second_stage_classifier() remain defined for the
+            # historical record (same convention as add_temporal_features).
 
             # Persist cache
             joblib.dump(calibrated_model, paths["calibrated_model"])
             joblib.dump(best_xgb, paths["base_model"])
-            joblib.dump(medians, paths["imputer_medians"])
-            joblib.dump(w_bounds, paths["winsorize_bounds"])
+            joblib.dump(indicator_cols, paths["missing_indicator_cols"])
+            joblib.dump(categories, paths["categorical_categories"])
             joblib.dump(sector_stats, paths["sector_stats"])
             joblib.dump(feature_columns, paths["feature_columns"])
-            joblib.dump(optimal_thresholds, paths["optimal_thresholds"])
-            joblib.dump({"use_thresholds": use_thresholds}, paths["prediction_strategy"])
-            joblib.dump(second_stage_model, paths["second_stage_model"])
 
         # ── Evaluation ────────────────────────────────────────────────────────
         proba = calibrated_model.predict_proba(X_test_enc)
-        pred_indices = (
-            (proba * optimal_thresholds).argmax(axis=1)
-            if use_thresholds
-            else calibrated_model.predict(X_test_enc)
-        )
-        # Apply second-stage Speculative/Distressed correction
-        pred_indices = apply_second_stage(pred_indices, X_test_enc, second_stage_model)
+        pred_indices = np.argmax(proba, axis=1)
 
         acc = accuracy_score(y_test, pred_indices)
         precision, recall, f1, _ = precision_recall_fscore_support(
@@ -737,6 +1045,11 @@ def main():
                 "matrix": cm.tolist(),
                 "shap": shap_data,
                 "shapStory": shap_story,
+                # Shared cross-model comparison tier: identical cleaning,
+                # split, features, and untuned-default estimator as the other
+                # three models' own fairBaseline (see shared_baseline.py) --
+                # None if the dataset was too small to split at all.
+                "fairBaseline": fair_baseline["metrics"] if fair_baseline else None,
             },
         }
 
